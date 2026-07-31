@@ -899,6 +899,7 @@ bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
 	case VK_RIGHT:  target_idx = 65; break; // →
 	case VK_DOWN:   target_idx = 69; break; // ↓
 	case VK_HOME:   target_idx = 60; break; // СТР (Домой)
+	case VK_PRIOR:  target_idx = 62; break; // СТР (Page Up)
 	}
 	if (target_idx != -1) {
 		int hw_code = rk_hardware_map[target_idx];
