@@ -44,6 +44,9 @@ bool rk_cc_pressed = false;       // CC (Shift) -> PC5
 bool rk_us_pressed = false;       // УС (Ctrl) -> PC6
 bool rk_rus_lat_pressed = false;  // РУС/ЛАТ -> PC7
 
+// --- ЭМУЛЯЦИЯ БИПЕРА INTE ---
+bool rk_inte_speaker_state = false; // Текущее состояние динамика от INTE
+
 HWND hRegListBox = NULL;
 
 // --- ПАРАМЕТРЫ ЗВУКОВОГО ПОТОКА КР580ВИ53 ---
@@ -52,33 +55,13 @@ HWAVEOUT hWaveOut = NULL;
 WAVEHDR waveHeader[2];
 short* audioBuffers[2] = { NULL, NULL };
 const int AUDIO_BUF_SIZE = 1024;
-/*
-struct TraceStep {
-	WORD pc;
-	BYTE opcode;
-	WORD sp;
-	WORD hl;
-	WORD bc;
-	WORD de;
-	BYTE a;
-};
 
-const int TRACE_LOG_SIZE = 32;
-TraceStep trace_log[TRACE_LOG_SIZE];
-int trace_log_index = 0;
+// --- Кольцевой буфер синхронизации INTE ---
+const int INTE_RING_BUF_SIZE = 16384;
+short inte_ring_buffer[INTE_RING_BUF_SIZE] = { 0 };
+volatile int inte_ring_write_ptr = 0;
+volatile int inte_ring_read_ptr = 0;
 
-// Функция для сохранения шага
-void LogTraceStep(WORD pc, BYTE opcode, WORD sp, WORD hl, WORD bc, WORD de, BYTE a) {
-	trace_log[trace_log_index].pc = pc;
-	trace_log[trace_log_index].opcode = opcode;
-	trace_log[trace_log_index].sp = sp;
-	trace_log[trace_log_index].hl = hl;
-	trace_log[trace_log_index].bc = bc;
-	trace_log[trace_log_index].de = de;
-	trace_log[trace_log_index].a = a;
-	trace_log_index = (trace_log_index + 1) % TRACE_LOG_SIZE;
-}
-*/
 #pragma pack(push, 1)
 struct CPU8080 {
 	BYTE A, B, C, D, E, H, L;
@@ -119,6 +102,7 @@ struct CPU8080 {
 		orion_page = 0;
 		orion_sys_port1 = 0;
 		orion_sys_port3 = 0;
+		rk_inte_speaker_state = false;
 		pit_control = 0x00;
 		for (int i = 0; i < 3; i++) {
 			pit_channels[i].count = 0; pit_channels[i].latch = 0;
@@ -273,26 +257,7 @@ struct CPU8080 {
 	// ИСПРАВЛЕННЫЙ АППАРАТНЫЙ ДИСПЕТЧЕР ЗАПИСИ В ПАМЯТЬ И ПОРТОВ (ОРИОН-128)
 	// =========================================================================
 	void Write(WORD addr, BYTE val) {
-/*
-		// Капкан для отладки
-		if (addr == 0x0000 && val == 0xFF) {
-			OutputDebugStringW(L"\n--- КРИТИЧЕСКИЙ ТРЕЙС-ЛОГ ПРОЦЕССОРА ---\n");
-			int idx = trace_log_index;
-			for (int i = 0; i < TRACE_LOG_SIZE; i++) {
-				TraceStep& step = trace_log[idx];
-				if (step.pc != 0) {
-					wchar_t buf[256];
-					swprintf(buf, 256, L"PC: %04Xh | Opcode: %02Xh | SP: %04Xh | HL: %04Xh | BC: %04Xh | A: %02Xh\n",
-						step.pc, step.opcode, step.sp, step.hl, step.bc, step.a);
-					OutputDebugStringW(buf);
-				}
-				idx = (idx + 1) % TRACE_LOG_SIZE;
-			}
-			OutputDebugStringW(L"-----------------------------------------\n");
-			DebugBreak();
-			return;
-		}
-*/
+
 		// 1. ПЗУ Монитора защищено от записи аппаратно!
 		if (addr >= 0xF800) {
 			// Исключение: Регистры конфигурации ОРИОНА (Порты F800, F900, FA00) отображены поверх ПЗУ
@@ -439,12 +404,8 @@ struct CPU8080 {
 			return 4; // Будем возвращать по 4 такта
 		}
 
-		//        WORD current_pc_before_fetch = PC; // Сохраняем адрес текущей инструкции
 		BYTE op = Read(PC++);
 		int cycles = lut_cycles[op];
-
-		// СОХРАНЯЕМ ТЕКУЩИЙ ШАГ В ЦИКЛИЧЕСКИЙ БУФЕР
-//        LogTraceStep(current_pc_before_fetch, op, SP, GetHL(), GetBC(), GetDE(), A);
 
 		// Группа команд MOV r1, r2 (исключая MOV M, M, которая является HLT 0x76)
 		if ((op & 0xC0) == 0x40 && op != 0x76) {
@@ -652,8 +613,8 @@ struct CPU8080 {
 		case 0xE3: { BYTE l = Read(SP); BYTE h = Read(SP + 1); Write(SP, L); Write(SP + 1, H); L = l; H = h; return cycles; }
 		case 0xF9: SP = GetHL(); return cycles;
 		case 0xE9: PC = GetHL(); return cycles;
-		case 0xFB: EI = true; return cycles;
-		case 0xF3: EI = false; return cycles;
+		case 0xFB: EI = true; rk_inte_speaker_state = true; return cycles;  // EI включает INTE
+		case 0xF3: EI = false; rk_inte_speaker_state = false; return cycles; // DI выключает INTE
 		}
 		return cycles;
 	}
@@ -661,7 +622,6 @@ struct CPU8080 {
 #pragma pack(pop)
 
 CPU8080 cpu;
-HWND button_matrix;
 
 // --- ЗАГРУЗКА И КОРРЕКТИРОВКА РОМОВ ---
 bool LoadRawBinaryFile(const wchar_t* filepath, BYTE* target_dest, size_t max_bytes) {
@@ -1159,16 +1119,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	return 0;
 }
 
+const double PIT_CLOCK_HZ = 2500000.0;
+const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
+
 // Генерирование звука через КР580ВИ53 на основе накопленной фазы частоты
 void FillAudioBuffer(short* buffer, int samplesCount) {
-	// Входная тактовая частота таймера КР580ВИ53 на Орионе-128
-	const double PIT_CLOCK_HZ = 2500000.0;
-
-	// Сколько тиков таймера приходится на один звуковой семпл звуковой карты ПК (1024 раз в буфер)
-	// Для 22050 Гц это примерно 2500000 / 22050 = 113.378688... тиков на семпл
-	const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
-
-	// Внутренний статический аккумулятор дробной части тиков, чтобы фаза не уплывала между вызовами буферов
 	static double ticks_accumulator = 0.0;
 
 	for (int i = 0; i < samplesCount; i++) {
@@ -1176,7 +1131,6 @@ void FillAudioBuffer(short* buffer, int samplesCount) {
 		int ticks_to_consume = (int)ticks_accumulator;
 		ticks_accumulator -= ticks_to_consume;
 
-		// Если за этот звуковой квант времени тики не накопились, дублируем предыдущее значение
 		if (ticks_to_consume <= 0) {
 			buffer[i] = (i > 0) ? buffer[i - 1] : 0;
 			continue;
@@ -1185,48 +1139,46 @@ void FillAudioBuffer(short* buffer, int samplesCount) {
 		int active_channels = 0;
 		int mixed_signal = 0;
 
-		// Обрабатываем все 3 независимых звуковых канала КР580ВИ53
+		// 1. Эмуляция каналов КР580ВИ53 (остается оригинальной)
 		for (int ch = 0; ch < 3; ch++) {
 			CPU8080::PITChannel& channel = cpu.pit_channels[ch];
 			WORD divisor = channel.count;
 			BYTE mode = channel.mode & 7;
 
-			// Звук в КР580ВИ53 генерируется преимущественно в Режиме 2 (Генератор частоты) 
-			// или Режиме 3 (Генератор меандра). Делитель ниже 4 физически не может звучать.
 			if (divisor > 3 && (mode == 2 || mode == 3)) {
-
-				// Переводим double фазу во внутренний вычитающий счетчик тиков, если это первая итерация
-				// Для этого используем переменную phase как внутренний таймер текущего полупериода
 				if (channel.phase <= 0.0 || channel.phase > (double)divisor) {
-					channel.phase = (double)(divisor / 2); // Инициализируем полупериод меандра
+					channel.phase = (double)(divisor / 2);
 				}
-
-				// Эмулируем прохождение тактов процессора Orion для этого канала
 				channel.phase -= (double)ticks_to_consume;
-
-				// Переключение состояния полярности меандра при пересечении нуля счетчиком
 				if (channel.phase <= 0.0) {
-					// Восстанавливаем счётчик полупериода на основе текущего делителя частоты канала
 					channel.phase += (double)(divisor / 2);
-
-					// Инвертируем полярность выхода (используем переменную latched как триггер знака, 
-					// так как в режиме генерации звука оригинальный регистр фиксации latch уже не нужен)
 					channel.latched = !channel.latched;
 				}
-
-				// Добавляем вклад канала: меандр со значением +1 или -1
 				mixed_signal += channel.latched ? 1 : -1;
 				active_channels++;
 			}
 		}
 
-		// Если есть активные каналы, нормируем амплитуду до безопасных 16-битных значений 
-		// (6000 единиц громкости на канал для исключения перегрузки и хрипов звукового тракта)
-		if (active_channels > 0) {
-			buffer[i] = (short)((mixed_signal * 6000) / active_channels);
+		// 2. Извлечение СИНХРОННОГО сигнала INTE из кольцевого буфера
+		int inte_signal = 0;
+		if (inte_ring_read_ptr != inte_ring_write_ptr) {
+			inte_signal = inte_ring_buffer[inte_ring_read_ptr];
+			inte_ring_read_ptr = (inte_ring_read_ptr + 1) % INTE_RING_BUF_SIZE;
 		}
 		else {
-			buffer[i] = 0; // Полная тишина, если таймеры выключены программой
+			// Если буфер пуст, берем последнее состояние (стабилизация)
+			inte_signal = rk_inte_speaker_state ? 4000 : -4000;
+		}
+
+		// 3. Микширование сигналов
+		if (active_channels > 0) {
+			// Нормализуем меандр ВИ53 к значениям громкости и прибавляем сигнал INTE
+			int vi53_signal = mixed_signal * 5000 / active_channels;
+			buffer[i] = (short)((vi53_signal + inte_signal) / 2);
+		}
+		else {
+			// Работает только чистый бипер INTE
+			buffer[i] = (short)inte_signal;
 		}
 	}
 }
@@ -1238,6 +1190,8 @@ void CALLBACK WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWO
 		waveOutWrite(hwo, pHdr, sizeof(WAVEHDR));
 	}
 }
+
+static double audio_ticks_accumulator = 0.0;
 
 // =========================================================================
 // ИСПРАВЛЕННАЯ СТАБИЛЬНАЯ ФУНКЦИЯ WINMAIN С КАДРОВЫМИ ПРЕРЫВАНИЯМИ 50 ГЦ
@@ -1354,6 +1308,23 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
 					cycles_to_execute -= elapsed_ticks;
 					internal_cycles_debt -= elapsed_ticks;
+
+					// Накапливаем процессорные такты для генерации звука
+					audio_ticks_accumulator += elapsed_ticks;
+					while (audio_ticks_accumulator >= TICKS_PER_SAMPLE) {
+						audio_ticks_accumulator -= TICKS_PER_SAMPLE;
+
+						// Генерируем сэмпл на основе ТЕКУЩЕГО состояния флага прямо сейчас
+						short sample = rk_inte_speaker_state ? 4000 : -4000;
+
+						// Записываем в кольцевой буфер
+						int next_write = (inte_ring_write_ptr + 1) % INTE_RING_BUF_SIZE;
+						// Защита от переполнения буфера
+						if (next_write != inte_ring_read_ptr) {
+							inte_ring_buffer[inte_ring_write_ptr] = sample;
+							inte_ring_write_ptr = next_write;
+						}
+					}
 
 					// Отсчитываем такты до кадрового прерывания 50 Гц
 					cpu.cycles_until_interrupt -= elapsed_ticks;
