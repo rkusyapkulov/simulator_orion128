@@ -824,7 +824,7 @@ void CreateKeyboardUI(HWND hwndParent, HINSTANCE hInst) {
 		L"Б\nB", L"Ю\n@", L",\n<", L"/\n?", L"РУС\nЛАТ", L"[ _ ]", L"[ _ ]"
 	};
 
-	static const wchar_t* side_labels[] = { L" ", L"F1", L"СТР", L"←", L"↑", L"→", L"F2", L"F3", L"F4", L"↓", L"AP2", L"" };
+	static const wchar_t* side_labels[] = { L"↖", L"F1", L"СТР", L"←", L"↑", L"→", L"F2", L"F3", L"F4", L"↓", L"AP2", L"" };
 
 	for (int idx = 0; idx < 60; idx++) {
 		int r = idx / 15; int c = idx % 15; int current_id = 1000 + idx;
@@ -870,37 +870,79 @@ static const int rk_hardware_map[] = {
 bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
 	int target_idx = -1;
 	switch (vkCode) {
-	case 0xC0: target_idx = 0; break;
-	case '1': target_idx = 1; break; case '2': target_idx = 2; break; case '3': target_idx = 3; break;
-	case '4': target_idx = 4; break; case '5': target_idx = 5; break; case '6': target_idx = 6; break;
-	case '7': target_idx = 7; break; case '8': target_idx = 8; break; case '9': target_idx = 9; break;
-	case '0': target_idx = 10; break; case 0xBD: target_idx = 11; break;
-	case 'Q': target_idx = 46; break; case 'W': target_idx = 33; break; case 'E': target_idx = 19; break;
-	case 'R': target_idx = 36; break; case 'T': target_idx = 51; break; case 'Y': target_idx = 32; break;
-	case 'U': target_idx = 17; break; case 'I': target_idx = 50; break; case 'O': target_idx = 37; break;
-	case 'P': target_idx = 35; break; case 'A': target_idx = 34; break; case 'S': target_idx = 48; break;
-	case 'D': target_idx = 39; break; case 'F': target_idx = 31; break; case 'G': target_idx = 21; break;
-	case 'H': target_idx = 25; break; case 'J': target_idx = 15; break; case 'K': target_idx = 18; break;
-	case 'L': target_idx = 38; break; case 'Z': target_idx = 24; break; case 'X': target_idx = 52; break;
-	case 'C': target_idx = 16; break; case 'V': target_idx = 40; break; case 'B': target_idx = 53; break;
-	case 'N': target_idx = 20; break; case 'M': target_idx = 49; break;
-	case 0xDB: target_idx = 22; break; case 0xDD: target_idx = 23; break; case 0xBA: target_idx = 26; break;
-	case 0xDE: target_idx = 41; break; case 0xBC: target_idx = 55; break; case 0xBE: target_idx = 42; break;
-	case 0xBF: target_idx = 56; break;
-	case VK_RETURN: target_idx = 27; break; // ВК
-	case VK_BACK:   target_idx = 43; break; // ЗБ
-	case VK_SPACE:  target_idx = 58; break; // Пробел
-	case VK_F1:     target_idx = 61; break; // Кнопка F1
-	case VK_F2:     target_idx = 66; break; // Кнопка F2
-	case VK_F3:     target_idx = 67; break; // Кнопка F3
-	case VK_F4:     target_idx = 68; break; // Кнопка F4
-	case VK_LEFT:   target_idx = 63; break; // ←
-	case VK_UP:     target_idx = 64; break; // ↑
-	case VK_RIGHT:  target_idx = 65; break; // →
-	case VK_DOWN:   target_idx = 69; break; // ↓
-	case VK_HOME:   target_idx = 60; break; // СТР (Домой)
+		// --- ЦИФРОВОЙ РЯД ПК ---
+	case 0xBB: target_idx = 26;  break; // Клавиша ` / Ё  -> мапим на [;] (Index 0)
+	case '1':  target_idx = 1;  break;
+	case '2':  target_idx = 2;  break;
+	case '3':  target_idx = 3;  break;
+	case '4':  target_idx = 4;  break;
+	case '5':  target_idx = 5;  break;
+	case '6':  target_idx = 6;  break;
+	case '7':  target_idx = 7;  break;
+	case '8':  target_idx = 8;  break;
+	case '9':  target_idx = 9;  break;
+	case '0':  target_idx = 10; break;
+	case 0xBD: target_idx = 11; break; // Клавиша минус [-] -> мапим на [-] (Index 11)
+
+		// --- БУКВЕННЫЕ КЛАВИШИ: СИМВОЛЬНОЕ СООТВЕТСТВИЕ QWERTY ---
+		// Ищем в main_labels, на какой кнопке РК находится нужная латинская буква
+	case 'Q': target_idx = 46; break; // Нажимаем ПК 'Q' -> РК выдает 'Q' (Кнопка Я/Q, Index 46)
+	case 'W': target_idx = 33; break; // Нажимаем ПК 'W' -> РК выдает 'W' (Кнопка В/W, Index 33)
+	case 'E': target_idx = 19; break; // Нажимаем ПК 'E' -> РК выдает 'E' (Кнопка Е/E, Index 19)
+	case 'R': target_idx = 36; break; // Нажимаем ПК 'R' -> РК выдает 'R' (Кнопка Р/R, Index 36)
+	case 'T': target_idx = 51; break; // Нажимаем ПК 'T' -> РК выдает 'T' (Кнопка Т/T, Index 51)
+	case 'Y': target_idx = 32; break; // Нажимаем ПК 'Y' -> РК выдает 'Y' (Кнопка Ы/Y, Index 32)
+	case 'U': target_idx = 17; break; // Нажимаем ПК 'U' -> РК выдает 'U' (Кнопка У/U, Index 17)
+	case 'I': target_idx = 50; break; // Нажимаем ПК 'I' -> РК выдает 'I' (Кнопка И/I, Index 50)
+	case 'O': target_idx = 37; break; // Нажимаем ПК 'O' -> РК выдает 'O' (Кнопка О/O, Index 37)
+	case 'P': target_idx = 35; break; // Нажимаем ПК 'P' -> РК выдает 'P' (Кнопка П/P, Index 35)
+
+	case 'A': target_idx = 34; break; // Нажимаем ПК 'A' -> РК выдает 'A' (Кнопка А/A, Index 34)
+	case 'S': target_idx = 48; break; // Нажимаем ПК 'S' -> РК выдает 'S' (Кнопка С/S, Index 48)
+	case 'D': target_idx = 39; break; // Нажимаем ПК 'D' -> РК выдает 'D' (Кнопка Д/D, Index 39)
+	case 'F': target_idx = 31; break; // Нажимаем ПК 'F' -> РК выдает 'F' (Кнопка Ф/F, Index 31)
+	case 'G': target_idx = 21; break; // Нажимаем ПК 'G' -> РК выдает 'G' (Кнопка Г/G, Index 21)
+	case 'H': target_idx = 25; break; // Нажимаем ПК 'H' -> РК выдает 'H' (Кнопка Х/H, Index 25)
+	case 'J': target_idx = 15; break; // Нажимаем ПК 'J' -> РК выдает 'J' (Кнопка Й/J, Index 15)
+	case 'K': target_idx = 18; break; // Нажимаем ПК 'K' -> РК выдает 'K' (Кнопка К/K, Index 18)
+	case 'L': target_idx = 38; break; // Нажимаем ПК 'L' -> РК выдает 'L' (Кнопка Л/L, Index 38)
+
+	case 'Z': target_idx = 24; break; // Нажимаем ПК 'Z' -> РК выдает 'Z' (Кнопка З/Z, Index 24)
+	case 'X': target_idx = 52; break; // Нажимаем ПК 'X' -> РК выдает 'X' (Кнопка Ь/X, Index 52)
+	case 'C': target_idx = 16; break; // Нажимаем ПК 'C' -> РК выдает 'C' (Кнопка Ц/C, Index 16)
+	case 'V': target_idx = 40; break; // Нажимаем ПК 'V' -> РК выдает 'V' (Кнопка Ж/\V, Index 40)
+	case 'B': target_idx = 53; break; // Нажимаем ПК 'B' -> РК выдает 'B' (Кнопка Б/B, Index 53)
+	case 'N': target_idx = 20; break; // Нажимаем ПК 'N' -> РК выдает 'N' (Кнопка Н/N, Index 20)
+	case 'M': target_idx = 49; break; // Нажимаем ПК 'M' -> РК выдает 'M' (Кнопка М/M, Index 49)
+
+		// --- ПУНКТУАЦИЯ И СПЕЦСИМВОЛЫ ---
+	case 0xDB: target_idx = 22; break; // Клавиша [ { -> мапим на Ш / [ (Index 22)
+	case 0xDD: target_idx = 23; break; // Клавиша ] } -> мапим на Щ / ] (Index 23)
+	case 0xBA: target_idx = 54; break; // Клавиша ; : -> мапим на : / * (Index 26)
+	case 0xDE: target_idx = 47; break; // Клавиша ' " -> мапим на Э / \ (Index 41)
+	case 0xDC: target_idx = 41; break; // Клавиша ' " -> мапим на Э / \ (Index 41)
+	case 0xC0: target_idx = 0; break; // Клавиша ' " -> мапим на Э / \ (Index 41)
+	case 0xBC: target_idx = 55; break; // Клавиша , < -> мапим на РК-шную запятую (Index 55)
+	case 0xBE: target_idx = 42; break; // Клавиша . > -> мапим на . / > (Index 42)
+	case 0xBF: target_idx = 56; break; // Клавиша / ? -> мапим на РК-шный слэш (Index 56)
+
+	case VK_RETURN: target_idx = 27; break; // ВК (Enter)
+	case VK_BACK:   target_idx = 43; break; // ЗБ (Backspace)
+	case VK_SPACE:  target_idx = 58; break; // ПРОБЕЛ
+
+		// --- УПРАВЛЯЮЩИЙ БЛОК ПК И СТРЕЛКИ ---
+	case VK_F1:    target_idx = 61; break; // Кнопка F1
+	case VK_F2:    target_idx = 66; break; // Кнопка F2
+	case VK_F3:    target_idx = 67; break; // Кнопка F3
+	case VK_F4:    target_idx = 68; break; // Кнопка F4
+	case VK_LEFT:  target_idx = 63; break;
+	case VK_UP:    target_idx = 64; break;
+	case VK_RIGHT: target_idx = 65; break;
+	case VK_DOWN:  target_idx = 69; break;
+	case VK_HOME:  target_idx = 60; break; // "в угол"
 	case VK_PRIOR:  target_idx = 62; break; // СТР (Page Up)
 	}
+
 	if (target_idx != -1) {
 		int hw_code = rk_hardware_map[target_idx];
 		out_row = hw_code / 8; out_col = hw_code % 8;
