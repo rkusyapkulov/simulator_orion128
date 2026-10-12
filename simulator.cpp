@@ -951,95 +951,174 @@ bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
 	return false;
 }
 
-// Загрузка бинарных дампов Ориона (.ORD / .BIN)
+// Автоматический поиск смещения для записи нового файла в RAM-диск B (orion_ram[1])
+WORD GetNextOrdosOffset() {
+	WORD offset = 0;
+	const WORD RAMDISK_TOP = 0xF000; // Верхняя граница рамдиска под системные нужды
+
+	while (offset < RAMDISK_TOP - 16) {
+		// Если встретили маркер пустого пространства или конца цепочки
+		if (orion_ram[1][offset] == 0xFF || orion_ram[1][offset] == 0x00) {
+			return offset;
+		}
+
+		// Читаем длину данных из ORDOS-заголовка текущего файла (смещение 10, 11)
+		WORD datasize = orion_ram[1][offset + 10] | (orion_ram[1][offset + 11] << 8);
+
+		// Защита от зацикливания при поврежденном каталоге
+		if (datasize == 0 || (offset + 16 + datasize) > RAMDISK_TOP) {
+			return offset;
+		}
+
+		offset += 16 + datasize;
+	}
+	return offset;
+}
+
 void LoadOrionFile(HWND hwnd) {
 	OPENFILENAMEW ofn;
-	wchar_t szFile[260] = { 0 };
+	wchar_t szFile[1024] = { 0 }; // Буфер увеличен для поддержки Multi-Select без STD
 	ZeroMemory(&ofn, sizeof(ofn));
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = hwnd;
 	ofn.lpstrFile = szFile;
-	ofn.nMaxFile = sizeof(szFile);
-	ofn.lpstrFilter = L"Файлы Орион-128 (.ord;.bin)\0*.ord;.bin\0Все файлы (*.*)\0*.*\0";
+	ofn.nMaxFile = sizeof(szFile) / sizeof(wchar_t);
+	ofn.lpstrFilter = L"Файлы Ориона (*.ord;*.rko;*.bru;*.bin)\0*.ord;*.rko;*.bru;*.bin\0Все файлы (*.*)\0*.*\0";
 	ofn.nFilterIndex = 1;
-	ofn.lpstrFileTitle = NULL;
-	ofn.nMaxFileTitle = 0;
-	ofn.lpstrInitialDir = NULL;
-	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
 
 	if (GetOpenFileNameW(&ofn) == TRUE) {
-		std::ifstream file(ofn.lpstrFile, std::ios::binary);
-		if (!file.is_open()) {
-			MessageBoxW(hwnd, L"Не удалось открыть файл!", L"Ошибка", MB_OK | MB_ICONERROR);
-			return;
-		}
+		// Указатель для ручного разбора путей Multi-Select (строки разделены '\0')
+		wchar_t* ptr = ofn.lpstrFile;
+		wchar_t dir[512] = { 0 };
+		wcscpy(dir, ptr);
+		ptr += wcslen(dir) + 1;
 
-		// Вычисляем точный физический размер файла на диске
-		file.seekg(0, std::ios::end);
-		size_t file_size = file.tellg();
-		file.seekg(0, std::ios::beg);
+		// Если выбран один файл, ptr сразу будет указывать на конец буфера. 
+		// Если несколько — dir содержит общую папку, а ptr последовательно имена файлов.
+		bool is_multi = (*ptr != L'\0');
+		int loaded_count = 0;
 
-		WORD load_address = 0x0000;
-		WORD file_length = 0;
-		bool has_header = false;
-
-		// Проверяем наличие 16-байтного заголовка ОС ORDOS
-		if (file_size >= 16) {
-			BYTE header[16];
-			file.read(reinterpret_cast<char*>(header), 16);
-
-			WORD test_load = header[8] | (header[9] << 8);
-			WORD test_len = header[10] | (header[11] << 8);
-
-			// Критерий корректности заголовка: длина кода + 16 байт заголовка == размер файла
-			if (test_len + 16 == file_size) {
-				load_address = test_load;
-				file_length = test_len;
-				has_header = true;
+		do {
+			wchar_t full_path[512] = { 0 };
+			if (is_multi) {
+				swprintf(full_path, 512, L"%s\\%s", dir, ptr);
+				ptr += wcslen(ptr) + 1;
 			}
+			else {
+				wcscpy(full_path, dir);
+			}
+
+			// Извлекаем расширение файла вручную (в нижнем регистре)
+			wchar_t ext[8] = { 0 };
+			wchar_t* dot = wcsrchr(full_path, L'.');
+			if (dot) {
+				int i = 0;
+				while (dot[i] && i < 7) {
+					ext[i] = towlower(dot[i]);
+					i++;
+				}
+			}
+
+			// Проверяем: если это обычный бинарник .BIN, обрабатываем по старому алгоритму
+			if (wcscmp(ext, L".bin") == 0) {
+				std::ifstream file(full_path, std::ios::binary);
+				if (file.is_open()) {
+					file.seekg(0, std::ios::end);
+					size_t file_size = file.tellg();
+					file.seekg(0, std::ios::beg);
+
+					WORD load_address = 0x0000;
+					WORD file_length = (file_size > 48 * 1024) ? 48 * 1024 : (WORD)file_size;
+
+					// Читаем исполняемый код программы строго в БАНК 0 (как было раньше)
+					file.read(reinterpret_cast<char*>(&orion_ram[0][load_address]), file_length);
+					file.close();
+
+					// Полный аппаратный сброс и подготовка контекста под запуск игры
+					orion_page = 0;
+					orion_sys_port1 = 0x24; // Форсируем игровой цветной режим 4-цв
+					orion_sys_port3 = 0;
+					cpu.EI = false;
+					cpu.PC = load_address;
+					cpu.SP = 0xEFFF;
+
+					orion_ram[0][0xBE03] = 0xC9; // Заглушка под ORDOS
+					for (int o_addr = 0xF000; o_addr < 0xF800; o_addr++) {
+						orion_ram[0][o_addr] = 0x00;
+					}
+					for (int i = 0; i < 8; i++) key_matrix_state[i] = 0xFF;
+
+					UpdateRegisterDisplay();
+					InvalidateRect(hwnd, NULL, FALSE);
+
+					wchar_t msg_buf[256];
+					swprintf(msg_buf, 256, L"Бинарный файл успешно запущен!\nАдрес старта: %04Xh\nРазмер: %d байт", load_address, file_length);
+					MessageBoxW(hwnd, msg_buf, L"Успех", MB_OK | MB_ICONINFORMATION);
+				}
+				return; // .BIN файлы обрабатываются одиночно, прерываем функцию
+			}
+
+			// --- ОБРАБОТКА ДЛЯ ФОРМАТОВ ORDOS (.ORD, .RKO, .BRU) ---
+			// Выводим предупреждение перед первой записью на диск B
+			if (loaded_count == 0) {
+				if (MessageBoxW(hwnd, L"Данные на RAM-диске B (страница 1) будут изменены.\nПродолжить?",
+					L"Внимание: Загрузка в RAM-диск", MB_OKCANCEL | MB_ICONEXCLAMATION) != IDOK) {
+					return;
+				}
+			}
+
+			std::ifstream file(full_path, std::ios::binary);
+			if (file.is_open()) {
+				file.seekg(0, std::ios::end);
+				size_t file_size = file.tellg();
+				file.seekg(0, std::ios::beg);
+
+				bool is_rko = (wcscmp(ext, L".rko") == 0);
+				if (is_rko) {
+					if (file_size > 77) {
+						file.seekg(77, std::ios::beg);
+						file_size -= 77;
+					}
+					else {
+						file.close();
+						continue;
+					}
+				}
+
+				const WORD RAMDISK_TOP = 0xF000;
+				WORD next_ordos = GetNextOrdosOffset();
+
+				if (next_ordos + 16 < RAMDISK_TOP) {
+					BYTE ordos_header[16];
+					if (file.read(reinterpret_cast<char*>(ordos_header), 16)) {
+						WORD datasize = ordos_header[10] | (ordos_header[11] << 8);
+
+						if (next_ordos + 16 + datasize < RAMDISK_TOP) {
+							// Копируем заголовок на страницу 1 (Диск B)
+							memcpy(&orion_ram[1][next_ordos], ordos_header, 16);
+							// Читаем данные следом за заголовком
+							file.read(reinterpret_cast<char*>(&orion_ram[1][next_ordos + 16]), datasize);
+
+							next_ordos += 16 + datasize;
+							orion_ram[1][next_ordos] = 0xFF; // Конец цепочки файлов
+							loaded_count++;
+						}
+					}
+				}
+				file.close();
+			}
+
+		} while (is_multi && *ptr != L'\0');
+
+		if (loaded_count > 0) {
+			UpdateRegisterDisplay();
+			InvalidateRect(hwnd, NULL, FALSE);
+
+			wchar_t msg_buf[256];
+			swprintf(msg_buf, 256, L"Загружено файлов на диск B: %d.\nПерезапустите Оболочку/Командер (кнопка F4).", loaded_count);
+			MessageBoxW(hwnd, msg_buf, L"Информация", MB_OK | MB_ICONINFORMATION);
 		}
-
-		// Если файл без заголовка (чистый бинарник RAW)
-		if (!has_header) {
-			file.seekg(0, std::ios::beg); // Сбрасываем указатель на начало файла
-			load_address = 0x0000;        // Шьем строго с нулевого адреса
-			file_length = (file_size > 48 * 1024) ? 48 * 1024 : (WORD)file_size;
-		}
-
-		// Читаем исполняемый код программы строго в БАНК 0 по вычисленному смещению
-		file.read(reinterpret_cast<char*>(&orion_ram[0][load_address]), file_length);
-		file.close();
-
-		// =================================================================
-		// АППАРАТНЫЙ СБРОС И НАСТРОЙКА ОКРУЖЕНИЯ ДЛЯ СТАРТА ИГРЫ:
-		// =================================================================
-		orion_page = 0;        // Принудительно включаем Банк ОЗУ №0
-		orion_sys_port1 = 0x7; // Форсируем цветной 4-цветный игровой режим (Бит D5=1, D2=1)
-		orion_sys_port3 = 0;   // Видеовыход строго на стандартный адрес 0xC000
-
-		cpu.EI = false;        // Выключаем прерывания, чтобы тики 50Гц не ломали вектор 0x0038
-		cpu.PC = load_address; // Устанавливаем точку старта процессора (0x0000)
-		cpu.SP = 0xEFFF;       // Выделяем стек в безопасной верхней зоне ОЗУ
-
-		// Системная интеграция: заполняем ОЗУ под нужды Монитора/ORDOS базовыми заглушками
-		// Чтобы при вызове системных подпрограмм процессор мгновенно возвращался в игру
-		orion_ram[0][0xBE03] = 0xC9; // Заглушка под ORDOS (команда RET)
-		for (int o_addr = 0xF000; o_addr < 0xF800; o_addr++) { // ИСПРАВЛЕНО: Добавлен тип int
-			orion_ram[0][o_addr] = 0x00; // Очищаем буфер системных переменных (NOP)
-		}
-
-		// Сброс физической матрицы клавиатуры в исходное ненажатое состояние
-		for (int i = 0; i < 8; i++) key_matrix_state[i] = 0xFF;
-
-		// Синхронизируем интерфейс отладки и перерисовываем окно эмулятора
-		UpdateRegisterDisplay();
-		InvalidateRect(hwnd, NULL, FALSE);
-
-		wchar_t msg_buf[256];
-		swprintf(msg_buf, 256, L"Файл успешно загружен!\nТип: %s\nАдрес старта: %04Xh\nРазмер кода: %d байт",
-			has_header ? L"ORDOS (.ORD с заголовком)" : L"Чистый дамп (.BIN RAW)",
-			load_address, file_length);
-		MessageBoxW(hwnd, msg_buf, L"Успех", MB_OK | MB_ICONINFORMATION);
 	}
 }
 
