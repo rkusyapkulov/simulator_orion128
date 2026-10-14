@@ -10,8 +10,14 @@
 #include <cwchar>
 #include <cmath>
 #include <commdlg.h>
+#include "8080.h"
 
 #pragma comment(lib, "winmm.lib")
+
+extern "C" int cpu8080_step(CPU8080* cpu);
+extern "C" void cpu8080_reset(CPU8080* cpu);
+
+#define SYSTEM_CLOCK_HZ 2500000
 
 // --- ПАРАМЕТРЫ ЭКРАНА ОРИОН-128 ---
 const int ORION_SCREEN_WIDTH = 384;
@@ -44,9 +50,6 @@ bool rk_cc_pressed = false;       // CC (Shift) -> PC5
 bool rk_us_pressed = false;       // УС (Ctrl) -> PC6
 bool rk_rus_lat_pressed = false;  // РУС/ЛАТ -> PC7
 
-// --- ЭМУЛЯЦИЯ БИПЕРА INTE ---
-bool rk_inte_speaker_state = false; // Текущее состояние динамика от INTE
-
 HWND hRegListBox = NULL;
 
 // --- ПАРАМЕТРЫ ЗВУКОВОГО ПОТОКА КР580ВИ53 ---
@@ -62,550 +65,292 @@ short inte_ring_buffer[INTE_RING_BUF_SIZE] = { 0 };
 volatile int inte_ring_write_ptr = 0;
 volatile int inte_ring_read_ptr = 0;
 
-#pragma pack(push, 1)
-struct CPU8080 {
-	BYTE A, B, C, D, E, H, L;
-	WORD PC, SP;
-	bool S, Z, AC, P, CY;
-	bool EI;
-	bool halted; // <-- ДОБАВИТЬ: флаг останова процессора
-	int cycles_until_interrupt = 50000; // 2500000 Гц / 50 Гц = 50000 тактов на кадр
-	bool int_pending = false;           // Флаг того, что прерывание пришло от дисплея
+#ifndef PIT_CLOCK_HZ
+#define PIT_CLOCK_HZ 2500000   // частота CLK таймера; подставьте значение из схемы вашего Ориона
+#endif
 
-	// Три порта КР580ВВ55 (ППА)
-	BYTE ppi0_pa, ppi0_pb, ppi0_pc, ppi0_ctrl; // 0F400H (Клавиатура РК)
-	BYTE ppi1_pa, ppi1_pb, ppi1_pc, ppi1_ctrl; // 0F500H (Пользователь №1)
-	BYTE ppi2_pa, ppi2_pb, ppi2_pc, ppi2_ctrl; // 0F600H (Пользователь №2)
+static uint16_t pit_bcd2bin(uint16_t v) {
+	return (uint16_t)(((v >> 12) & 15) * 1000 + ((v >> 8) & 15) * 100 + ((v >> 4) & 15) * 10 + (v & 15));
+}
+static uint16_t pit_bin2bcd(uint16_t v) {
+	v %= 10000;
+	return (uint16_t)(((v / 1000) << 12) | (((v / 100) % 10) << 8) | (((v / 10) % 10) << 4) | (v % 10));
+}
+static uint16_t pit_norm(uint32_t v, int bcd) { return (uint16_t)(bcd ? v % 10000u : v & 0xFFFFu); }
+static uint16_t pit_dec(uint16_t c, int bcd) { return c == 0 ? (uint16_t)(bcd ? 9999 : 0xFFFF) : (uint16_t)(c - 1); }
 
-	// Состояние КР580ВИ53 (Таймер/Звук по адресам 0F730H-0F733H)
-	struct PITChannel {
-		WORD count;
-		WORD latch;
-		BYTE mode;
-		BYTE bcd;
-		BYTE access_phase;
-		bool latched;
-		double phase;
-	} pit_channels[3];
-	BYTE pit_control;
+static void pit_load(PITChannel* ch, uint16_t raw) {
+	uint16_t v = ch->bcd ? pit_norm(pit_bcd2bin(raw), 1) : raw;
+	ch->reload = v;
+	switch (ch->mode) {
+	case 0: ch->count = v; ch->armed = true; ch->out = false; ch->state = 0; break;
+	case 4: ch->count = v; ch->armed = true; ch->out = true;  ch->state = 0; break;
+	case 2: case 3:
+		if (!ch->armed) {   // новый счёт подхватывается в конце периода, если счётчик уже идёт
+			ch->armed = true; ch->out = true;
+			ch->count = (ch->mode == 3) ? pit_norm((uint32_t)v + (v & 1), ch->bcd) : v;
+		}
+		break;
+	default: break;
+	}
+}
 
-	void Reset() {
-		PC = 0xF800; // Старт из ПЗУ МОНИТОР (находится на верхней странице)
-		SP = 0x0000;
-		A = B = C = D = E = H = L = 0;
-		S = Z = AC = P = CY = false;
-		EI = false;
-		halted = false; // <-- ДОБАВИТЬ: сброс флага при перезагрузке
-		ppi0_pa = ppi0_pb = ppi0_pc = 0xFF; ppi0_ctrl = 0x9B;
-		ppi1_pa = ppi1_pb = ppi1_pc = 0xFF; ppi1_ctrl = 0x9B;
-		ppi2_pa = ppi2_pb = ppi2_pc = 0xFF; ppi2_ctrl = 0x9B;
-		orion_page = 0;
-		orion_sys_port1 = 0;
-		orion_sys_port3 = 0;
-		rk_inte_speaker_state = false;
-		pit_control = 0x00;
-		for (int i = 0; i < 3; i++) {
-			pit_channels[i].count = 0; pit_channels[i].latch = 0;
-			pit_channels[i].mode = 0; pit_channels[i].bcd = 0;
-			pit_channels[i].access_phase = 0;
-			pit_channels[i].latched = false;
-			pit_channels[i].phase = 0.0;
+static void pit_write_control(CPU8080* cpu, uint8_t val) {
+	cpu->pit_control = val;
+	int sel = (val >> 6) & 3;
+	if (sel == 3) return;                       // у ВИ53 нет команды Read-Back
+	PITChannel* ch = &cpu->pit_channels[sel];
+	int rw = (val >> 4) & 3;
+	if (rw == 0) {                              // защёлкивание: режим и счёт не затрагиваются
+		if (!ch->latched) { ch->latch = ch->count; ch->latched = true; }
+		return;
+	}
+	int m = (val >> 1) & 7;
+	if (m >= 6) m -= 4;                         // режимы 6 и 7 - синонимы 2 и 3
+	ch->mode = (uint8_t)m;
+	ch->bcd = val & 1;
+	ch->rw_mode = (uint8_t)rw;
+	ch->access_phase = ch->read_phase = 0;
+	ch->latched = false; ch->armed = false; ch->state = 0;
+	ch->out = (m != 0);
+}
+
+static void pit_write_count(PITChannel* ch, uint8_t val) {
+	uint16_t v;
+	if (ch->rw_mode == 0) return;               // слово режима ещё не записано
+	if (ch->rw_mode == 1) v = val;
+	else if (ch->rw_mode == 2) v = (uint16_t)(val << 8);
+	else if (ch->access_phase == 0) {
+		ch->wr_lo = val; ch->access_phase = 1;
+		if (ch->mode == 0) { ch->armed = false; ch->out = false; }  // режим 0: счёт стоит до записи MSB
+		return;
+	}
+	else {
+		v = (uint16_t)((val << 8) | ch->wr_lo); ch->access_phase = 0;
+	}
+	pit_load(ch, v);
+}
+
+static uint8_t pit_read_count(PITChannel* ch) {
+	uint16_t c = ch->latched ? ch->latch : ch->count;
+	if (ch->bcd) c = pit_bin2bcd(c);
+	uint8_t r;
+	if (ch->rw_mode == 2) { r = (uint8_t)(c >> 8); ch->latched = false; }
+	else if (ch->rw_mode == 1) { r = (uint8_t)(c & 0xFF); ch->latched = false; }
+	else if (ch->read_phase == 0) { r = (uint8_t)(c & 0xFF); ch->read_phase = 1; }
+	else { r = (uint8_t)(c >> 8); ch->read_phase = 0; ch->latched = false; }
+	return r;
+}
+
+static void pit_tick_channel(PITChannel* ch, int n) {
+	for (; n > 0 && ch->armed; n--) {
+		switch (ch->mode) {
+		case 0:
+			ch->count = pit_dec(ch->count, ch->bcd);
+			if (ch->count == 0) ch->out = true;   // после терминального счёта счётчик продолжает считать
+			break;
+		case 2:
+			ch->count = pit_dec(ch->count, ch->bcd);
+			if (ch->count == 1) ch->out = false;
+			else if (ch->count == 0) { ch->count = ch->reload; ch->out = true; }
+			break;
+		case 3:
+			ch->count = pit_dec(pit_dec(ch->count, ch->bcd), ch->bcd);
+			if (ch->count == 0) {
+				ch->out = !ch->out;
+				uint32_t r = ch->reload;
+				ch->count = pit_norm(ch->out ? r + (r & 1) : (r & ~1u), ch->bcd);
+			}
+			break;
+		case 4:
+			ch->count = pit_dec(ch->count, ch->bcd);
+			if (ch->state == 1) { ch->out = true; ch->state = 2; }
+			else if (ch->state == 0 && ch->count == 0) { ch->out = false; ch->state = 1; }
+			break;
+		default: return;
 		}
 	}
+}
 
-	void SetFlagsZSP(BYTE res) {
-		Z = (res == 0);
-		S = ((res & 0x80) != 0);
-		BYTE Ty = res;
-		Ty ^= Ty >> 4; Ty ^= Ty >> 2; Ty ^= Ty >> 1;
-		P = !(Ty & 1);
+static void pit_tick(CPU8080* cpu, int n) {
+	for (int i = 0; i < 3; i++) pit_tick_channel(&cpu->pit_channels[i], n);
+}
+
+void orion128_reset(CPU8080* cpu) {
+	orion_page = 0;
+	orion_sys_port1 = 0;
+	orion_sys_port3 = 0;
+
+	rk_cc_pressed = false;
+	rk_us_pressed = false;
+	rk_rus_lat_pressed = false;
+
+	for (int i = 0; i < 8; i++) {
+		key_matrix_state[i] = 0xFF;
 	}
 
-	void SetFlagsINR(BYTE old_val, BYTE new_val) {
-		AC = ((old_val & 0x0F) + 1 > 0x0F);
-		SetFlagsZSP(new_val);
+	cpu8080_reset(cpu);
+}
+
+// =========================================================================
+// ИСПРАВЛЕННЫЙ АППАРАТНЫЙ ДИСПЕТЧЕР ЧТЕНИЯ ПАМЯТИ И ПОРТОВ (ОРИОН-128)
+// =========================================================================
+extern "C" uint8_t cpu8080_read(CPU8080* cpu, uint16_t addr) {
+	// 1. Зона системного Монитора / BIOS (0xF800 - 0xFFFF)
+	if (addr >= 0xF800) {
+		return orion_ram[0][addr];
 	}
 
-	void SetFlagsDCR(BYTE old_val, BYTE new_val) {
-		AC = ((old_val & 0x0F) == 0);
-		SetFlagsZSP(new_val);
-	}
+	int current_bank = orion_page & 3;
 
-	void SetFlagsAdd(BYTE r1, BYTE r2, int res) {
-		CY = (res > 0xFF);
-		AC = (((r1 & 0xF) + (r2 & 0xF)) > 0xF);
-		SetFlagsZSP((BYTE)res);
-	}
+	// 2. Дешифрация аппаратных портов ввода-вывода (0xF400 - 0xF7FF)
+	// В Орионе порты доступны только при определенных конфигурациях, проверим стандартное окно:
+	if ((current_bank == 0 || current_bank == 1) && addr >= 0xF400 && addr <= 0xF7FF) {
 
-	void SetFlagsSub(BYTE r1, BYTE r2, int res) {
-		CY = (res < 0);
-		AC = (((r1 & 0xF) - (r2 & 0xF)) < 0);
-		SetFlagsZSP((BYTE)res);
-	}
-
-	WORD GetHL() const { return (H << 8) | L; }
-	void SetHL(WORD val) { H = val >> 8; L = val & 0xFF; }
-	WORD GetBC() const { return (B << 8) | C; }
-	void SetBC(WORD val) { B = val >> 8; C = val & 0xFF; }
-	WORD GetDE() const { return (D << 8) | E; }
-	void SetDE(WORD val) { D = val >> 8; E = val & 0xFF; }
-
-	BYTE GetReg(int r) {
-		switch (r) {
-		case 0: return B; case 1: return C; case 2: return D; case 3: return E;
-		case 4: return H; case 5: return L; case 6: return Read(GetHL()); default: return A;
-		}
-	}
-
-	void SetReg(int r, BYTE val) {
-		switch (r) {
-		case 0: B = val; break; case 1: C = val; break; case 2: D = val; break; case 3: E = val; break;
-		case 4: H = val; break; case 5: L = val; break; case 6: Write(GetHL(), val); break; default: A = val; break;
-		}
-	}
-
-	// =========================================================================
-	// ИСПРАВЛЕННЫЙ АППАРАТНЫЙ ДИСПЕТЧЕР ЧТЕНИЯ ПАМЯТИ И ПОРТОВ (ОРИОН-128)
-	// =========================================================================
-	BYTE Read(WORD addr) {
-		// 1. Зона системного Монитора / BIOS (0xF800 - 0xFFFF)
-		// Код Монитора должен исполняться ИЗ БАНКА 0 ВСЕГДА, из любого банка ОЗУ!
-		if (addr >= 0xF800) {
-			return orion_ram[0][addr];
-		}
-
-		// 2. Дешифрация аппаратных портов ввода-вывода (0xF400 - 0xF7FF)
-		// Доступны только если мы не в режиме "чистого сплошного ОЗУ" (по умолчанию в Банках 0 и 1 они видны)
-		int current_bank = orion_page & 3;
-		if ((current_bank == 0 || current_bank == 1) && addr >= 0xF400 && addr <= 0xF7FF) {
-			// К580ВВ55 №1: Порт клавиатуры (0xF400 - 0xF403)
-			if (addr <= 0xF403) {
-				WORD reg = addr & 3;
-				if (reg == 0) return ppi0_pa;
-				if (reg == 1) {
-					BYTE result_pb = 0xFF;
-					for (int col = 0; col < 8; col++) {
-						if ((ppi0_pa & (1 << col)) == 0) {
-							result_pb &= key_matrix_state[col];
-						}
+		// К580ВВ55 №1: Порт клавиатуры (0xF400 - 0xF403)
+		if ((addr & 0xFF00) == 0xF400) {
+			uint16_t reg = addr & 3;
+			if (reg == 0) return cpu->ppi0_pa;
+			if (reg == 1) {
+				uint8_t result_pb = 0xFF;
+				for (int col = 0; col < 8; col++) {
+					// Если бит в PA сброшен в 0, значит Монитор проверяет этот ряд клавиатуры
+					if ((cpu->ppi0_pa & (1 << col)) == 0) {
+						result_pb &= key_matrix_state[col];
 					}
-					return result_pb;
 				}
-				if (reg == 2) {
-					BYTE result_pc = ppi0_pc | 0xE0;
-					if (rk_cc_pressed) result_pc &= ~(1 << 5);
-					if (rk_us_pressed) result_pc &= ~(1 << 6);
-					if (rk_rus_lat_pressed) result_pc &= ~(1 << 7);
-					return result_pc;
-				}
-				return ppi0_ctrl;
-			}
-			// К580ВВ55 №2: Интерфейс ROM-диска (0xF500 - 0xF503)
-			if (addr >= 0xF500 && addr <= 0xF503) {
-				WORD reg = addr & 3;
-				if (reg == 0) {
-					WORD rom_address = (ppi1_pc << 8) | ppi1_pb;
-					return rom_disk_storage[rom_address];
-				}
-				if (reg == 1) return ppi1_pb;
-				if (reg == 2) return ppi1_pc;
-				return ppi1_ctrl;
-			}
-			// Пользовательский порт №3 (0xF600 - 0xF603)
-			if (addr >= 0xF600 && addr <= 0xF603) {
-				WORD reg = addr & 3;
-				if (reg == 0) return ppi2_pa;
-				if (reg == 1) return ppi2_pb;
-				if (reg == 2) return ppi2_pc;
-				return ppi2_ctrl;
-			}
-			// Системный трехканальный таймер КР580ВИ53 (0xF730 - 0xF733)
-			if (addr >= 0xF730 && addr <= 0xF733) {
-				WORD reg = addr & 3;
-				if (reg < 3) {
-					PITChannel& ch = pit_channels[reg];
-					BYTE val = 0;
-					WORD src = ch.latched ? ch.latch : ch.count;
-					if (ch.access_phase == 0) {
-						val = src & 0xFF;
-						ch.access_phase = 1;
+				// Если Монитор выставил в PA значение 0x00 (проверить все клавиши разом)
+				if (cpu->ppi0_pa == 0x00) {
+					for (int i = 0; i < 8; i++) {
+						result_pb &= key_matrix_state[i];
 					}
-					else {
-						val = (src >> 8) & 0xFF;
-						ch.access_phase = 0;
-						ch.latched = false;
-					}
-					return val;
 				}
-				return 0xFF;
+				return result_pb;
 			}
-			return 0xFF;
+			if (reg == 2) {
+				uint8_t result_pc = cpu->ppi0_pc | 0xE0;
+				if (rk_cc_pressed) result_pc &= ~(1 << 5);
+				if (rk_us_pressed) result_pc &= ~(1 << 6);
+				if (rk_rus_lat_pressed) result_pc &= ~(1 << 7);
+				return result_pc;
+			}
+			return cpu->ppi0_ctrl;
 		}
 
-		// 3. Служебная область системных переменных Монитора (0xF000 - 0xF3FF)
-		// Переменные и СТЕК Монитора ВСЕГДА должны читаться из Банка 0 в системных режимах!
-		if ((current_bank == 0 || current_bank == 1) && addr >= 0xF000 && addr <= 0xF3FF) {
-			return orion_ram[0][addr];
+		// К580ВВ55 №2: Интерфейс ROM-диска (0xF500 - 0xF503)
+		if ((addr & 0xFF00) == 0xF500) {
+			uint16_t reg = addr & 3;
+			if (reg == 0) {
+				uint16_t rom_address = (cpu->ppi1_pc << 8) | cpu->ppi1_pb;
+				return rom_disk_storage[rom_address];
+			}
+			if (reg == 1) return cpu->ppi1_pb;
+			if (reg == 2) return cpu->ppi1_pc;
+			return cpu->ppi1_ctrl;
 		}
 
-		// 4. Чтение обычной памяти из выбранного текущего банка процессора (0 - 3)
-		return orion_ram[current_bank][addr];
+		// ППА №3: 0xF600–0xF603
+		if ((addr & 0xFF00) == 0xF600) {
+			switch (addr & 3) {
+			case 0: return cpu->ppi2_pa;
+			case 1: return cpu->ppi2_pb;
+			case 2: return cpu->ppi2_pc;
+			default: return cpu->ppi2_ctrl;
+			}
+		}
+
+		// Таймер КР580ВИ53: 0xF730–0xF733
+		if (addr >= 0xF730 && addr <= 0xF733) {
+			uint16_t reg = addr & 3;
+
+			if (reg < 3) return pit_read_count(&cpu->pit_channels[reg]);
+
+			return cpu->pit_control;
+		}
+
+		return 0xFF; // Неподключённый адрес окна ввода-вывода: шина "плавает"
 	}
 
+	// 3. Служебная область системных переменных Монитора (0xF000 - 0xF3FF)
+	if ((current_bank == 0 || current_bank == 1) && addr >= 0xF000 && addr <= 0xF3FF) {
+		return orion_ram[0][addr];
+	}
 
-	// =========================================================================
-	// ИСПРАВЛЕННЫЙ АППАРАТНЫЙ ДИСПЕТЧЕР ЗАПИСИ В ПАМЯТЬ И ПОРТОВ (ОРИОН-128)
-	// =========================================================================
-	void Write(WORD addr, BYTE val) {
+	// 4. Чтение из выбранного банка
+	return orion_ram[current_bank][addr];
+}
 
-		// 1. ПЗУ Монитора защищено от записи аппаратно!
-		if (addr >= 0xF800) {
-			// Исключение: Регистры конфигурации ОРИОНА (Порты F800, F900, FA00) отображены поверх ПЗУ
-			WORD port_type = addr & 0xFF00;
-			if (port_type == 0xF800) { orion_sys_port1 = val; return; }
-			if (port_type == 0xF900) { orion_page = val & 3; return; }
-			if (port_type == 0xFA00) { orion_sys_port3 = val & 3; return; }
-			return; // Запись в само ПЗУ игнорируется
-		}
 
-		int current_bank = orion_page & 3;
+// =========================================================================
+// ИСПРАВЛЕННЫЙ АППАРАТНЫЙ ДИСПЕТЧЕР ЗАПИСИ В ПАМЯТЬ И ПОРТОВ (ОРИОН-128)
+// =========================================================================
+extern "C" void cpu8080_write(CPU8080* cpu, uint16_t addr, uint8_t val) {
 
-		// 2. Запись в периферийные БИС К580ВВ55 и КР580ВИ53 (0xF400 - 0xF7FF)
-		if ((current_bank == 0 || current_bank == 1) && addr >= 0xF400 && addr <= 0xF7FF) {
-			// Микросхема PPI 0 (Клавиатура и динамик)
-			if (addr <= 0xF403) {
-				WORD reg = addr & 3;
-				if (reg == 0) ppi0_pa = val;
-				else if (reg == 1) ppi0_pb = val;
-				else if (reg == 2) {
-					ppi0_pc = val;
-					bool current_bit = (val & 0x10) != 0;
-					if (current_bit != last_speaker_bit_state) {
-						last_speaker_bit_state = current_bit;
-						MessageBeep(MB_OK);
-					}
-				}
-				else {
-					ppi0_ctrl = val;
-					if ((val & 0x80) == 0) {
-						int bit_to_change = (val >> 1) & 7;
-						if (val & 1) ppi0_pc |= (1 << bit_to_change);
-						else ppi0_pc &= ~(1 << bit_to_change);
-					}
-				}
-				return;
+	// 1. ПЗУ Монитора защищено от записи аппаратно!
+	if (addr >= 0xF800) {
+		uint16_t port_type = addr & 0xFF00;
+		if (port_type == 0xF800) { orion_sys_port1 = val; return; }
+		if (port_type == 0xF900) { orion_page = val & 3; return; }
+		if (port_type == 0xFA00) { orion_sys_port3 = val & 3; return; }
+		return;
+	}
+
+	int current_bank = orion_page & 3;
+
+	// 2. Запись в периферийные БИС К580ВВ55 и КР580ВИ53 (0xF400 - 0xF7FF)
+	if ((current_bank == 0 || current_bank == 1) && addr >= 0xF400 && addr <= 0xF7FF) {
+		if ((addr & 0xFF00) == 0xF400) {
+			uint16_t reg = addr & 3;
+			if (reg == 0) cpu->ppi0_pa = val;
+			else if (reg == 1) cpu->ppi0_pb = val;
+			else if (reg == 2) {
+				cpu->ppi0_pc = val;
 			}
-			// Микросхема PPI 1 (Вторая плата / ROM-диск)
-			if (addr >= 0xF500 && addr <= 0xF503) {
-				WORD reg = addr & 3;
-				if (reg == 0) ppi1_pa = val;
-				else if (reg == 1) ppi1_pb = val;
-				else if (reg == 2) ppi1_pc = val;
-				else ppi1_ctrl = val;
-				return;
-			}
-			// Порт №2 (0xF600 - 0xF603)
-			if (addr >= 0xF600 && addr <= 0xF603) {
-				WORD reg = addr & 3;
-				if (reg == 0) { ppi2_pa = val; }
-				else if (reg == 1) { ppi2_pb = val; }
-				else if (reg == 2) { ppi2_pc = val; }
-				else ppi2_ctrl = val;
-				return;
-			}
-			// Системный таймер КР580ВИ53 (PIT)
-			if (addr >= 0xF730 && addr <= 0xF733) {
-				WORD reg = addr & 3;
-				if (reg < 3) {
-					PITChannel& ch = pit_channels[reg];
-					if (ch.access_phase == 0) {
-						ch.count = (ch.count & 0xFF00) | val;
-						ch.access_phase = 1;
-					}
-					else {
-						ch.count = (ch.count & 0x00FF) | (val << 8);
-						ch.access_phase = 0;
-					}
+			else {
+				cpu->ppi0_ctrl = val;
+				if ((val & 0x80) == 0) {
+					int bit_to_change = (val >> 1) & 7;
+					if (val & 1) cpu->ppi0_pc |= (1 << bit_to_change);
+					else cpu->ppi0_pc &= ~(1 << bit_to_change);
 				}
-				else {
-					pit_control = val;
-					int sel_ch = (val >> 6) & 3;
-					if (sel_ch < 3) {
-						pit_channels[sel_ch].mode = (val >> 1) & 7;
-						pit_channels[sel_ch].bcd = val & 1;
-						pit_channels[sel_ch].access_phase = 0;
-						int rw_mode = (val >> 4) & 3;
-						if (rw_mode == 0) {
-							pit_channels[sel_ch].latch = pit_channels[sel_ch].count;
-							pit_channels[sel_ch].latched = true;
-						}
-					}
-				}
-				return;
 			}
 			return;
 		}
-
-		// 3. Служебная зона ОЗУ Монитора (0xF000 - 0xF3FF) - всегда строго в Банк 0
-		if ((current_bank == 0 || current_bank == 1) && addr >= 0xF000 && addr <= 0xF3FF) {
-			orion_ram[0][addr] = val;
+		if ((addr & 0xFF00) == 0xF500) {
+			uint16_t reg = addr & 3;
+			if (reg == 0) cpu->ppi1_pa = val;
+			else if (reg == 1) cpu->ppi1_pb = val;
+			else if (reg == 2) cpu->ppi1_pc = val;
+			else cpu->ppi1_ctrl = val;
 			return;
 		}
-
-		// 4. Обычная линейная запись в память текущего банка процессора (0, 1, 2, 3)
-		orion_ram[current_bank][addr] = val;
+		if ((addr & 0xFF00) == 0xF600) {
+			uint16_t reg = addr & 3;
+			if (reg == 0) { cpu->ppi2_pa = val; }
+			else if (reg == 1) { cpu->ppi2_pb = val; }
+			else if (reg == 2) { cpu->ppi2_pc = val; }
+			else cpu->ppi2_ctrl = val;
+			return;
+		}
+		// Системный таймер КР580ВИ53 (PIT)
+		if (addr >= 0xF730 && addr <= 0xF733) {
+			uint16_t reg = addr & 3;
+			if (reg < 3) pit_write_count(&cpu->pit_channels[reg], val);
+			else pit_write_control(cpu, val);
+			return;
+		}
+		return;
 	}
 
-	int Step() {
-		// Таблица базовых тактов для всех 256 инструкций Intel 8080
-		static const int lut_cycles[256] = {
-			4, 10, 7,  5,  5,  5,  7,  4,  4, 10, 7,  5,  5,  5,  7,  4,  // 00-0F
-			4, 10, 7,  5,  5,  5,  7,  4,  4, 10, 7,  5,  5,  5,  7,  4,  // 10-1F
-			4, 10, 16, 5,  5,  5,  7,  4,  4, 10, 16, 5,  5,  5,  7,  4,  // 20-2F
-			4, 10, 13, 5,  10, 10, 10, 4,  4, 10, 13, 5,  5,  5,  7,  4,  // 30-3F
-			5, 5,  5,  5,  5,  5,  7,  5,  5, 5,  5,  5,  5,  5,  7,  5,  // 40-4F
-			5, 5,  5,  5,  5,  5,  7,  5,  5, 5,  5,  5,  5,  5,  7,  5,  // 50-5F
-			5, 5,  5,  5,  5,  5,  7,  5,  5, 5,  5,  5,  5,  5,  7,  5,  // 60-6F
-			7, 7,  7,  7,  7,  7,  7,  7,  5, 5,  5,  5,  5,  5,  7,  5,  // 70-7F
-			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // 80-8F
-			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // 90-9F
-			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // A0-AF
-			4, 4,  4,  4,  4,  4,  7,  4,  4, 4,  4,  4,  4,  4,  7,  4,  // B0-BF
-			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // C0-CF
-			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // D0-DF
-			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11, // E0-EF
-			5, 10, 10, 10, 11, 11, 7,  11, 5, 10, 10, 10, 11, 17, 7,  11  // F0-FF
-		};
-
-		// 1. Проверяем аппаратное прерывание перед декодированием инструкции
-		if (int_pending && EI) {
-			int_pending = false;
-			halted = false;
-		}
-
-		// 2. Если процессор в состоянии HLT
-		if (halted) {
-			return 4; // Будем возвращать по 4 такта
-		}
-
-		BYTE op = Read(PC++);
-		int cycles = lut_cycles[op];
-
-		// Группа команд MOV r1, r2 (исключая MOV M, M, которая является HLT 0x76)
-		if ((op & 0xC0) == 0x40 && op != 0x76) {
-			SetReg((op >> 3) & 7, GetReg(op & 7));
-			return cycles;
-		}
-
-		switch (op) {
-				 // NOP инструкции
-		case 0x00: case 0x08: case 0x10: case 0x18: case 0x20: case 0x28:
-		case 0x30: case 0x38: return cycles;
-
-				 // Останавливаем процессор до аппаратного прерывания
-		case 0x76: halted = true; return cycles;
-
-				 // MVI r, imm
-		case 0x06: B = Read(PC++); return cycles;
-		case 0x0E: C = Read(PC++); return cycles;
-		case 0x16: D = Read(PC++); return cycles;
-		case 0x1E: E = Read(PC++); return cycles;
-		case 0x26: H = Read(PC++); return cycles;
-		case 0x2E: L = Read(PC++); return cycles;
-		case 0x36: Write(GetHL(), Read(PC++)); return cycles;
-		case 0x3E: A = Read(PC++); return cycles;
-
-				 // LXI rp, imm
-		case 0x01: { WORD l = Read(PC++); WORD h = Read(PC++); SetBC((h << 8) | l); return cycles; }
-		case 0x11: { WORD l = Read(PC++); WORD h = Read(PC++); SetDE((h << 8) | l); return cycles; }
-		case 0x21: { WORD l = Read(PC++); WORD h = Read(PC++); SetHL((h << 8) | l); return cycles; }
-		case 0x31: { WORD l = Read(PC++); WORD h = Read(PC++); SP = (h << 8) | l; return cycles; }
-
-				 // ADD r
-		case 0x80: case 0x81: case 0x82: case 0x83: case 0x84: case 0x85:
-		case 0x86: case 0x87: { BYTE src = GetReg(op & 7); int r = A + src; SetFlagsAdd(A, src, r); A = (BYTE)r; return cycles; }
-
-				 // ADC r
-		case 0x88: case 0x89: case 0x8A: case 0x8B: case 0x8C: case 0x8D:
-		case 0x8E: case 0x8F: { BYTE src = GetReg(op & 7); int r = A + src + (CY ? 1 : 0); SetFlagsAdd(A, src, r); A = (BYTE)r; return cycles; }
-
-				 // SUB r
-		case 0x90: case 0x91: case 0x92: case 0x93: case 0x94: case 0x95:
-		case 0x96: case 0x97: { BYTE src = GetReg(op & 7); int r = A - src; SetFlagsSub(A, src, r); A = (BYTE)r; return cycles; }
-
-				 // SBB r
-		case 0x98: case 0x99: case 0x9A: case 0x9B: case 0x9C: case 0x9D:
-		case 0x9E: case 0x9F: { BYTE src = GetReg(op & 7); int r = A - src - (CY ? 1 : 0); SetFlagsSub(A, src, r); A = (BYTE)r; return cycles; }
-
-				 // ANA r
-		case 0xA0: case 0xA1: case 0xA2: case 0xA3: case 0xA4: case 0xA5:
-		case 0xA6: case 0xA7: { A &= GetReg(op & 7); CY = false; AC = true; SetFlagsZSP(A); return cycles; }
-
-				 // XRA r
-		case 0xA8: case 0xA9: case 0xAA: case 0xAB: case 0xAC: case 0xAD:
-		case 0xAE: case 0xAF: { A ^= GetReg(op & 7); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
-
-				 // ORA r
-		case 0xB0: case 0xB1: case 0xB2: case 0xB3: case 0xB4: case 0xB5:
-		case 0xB6: case 0xB7: { A |= GetReg(op & 7); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
-
-				 // CMP r
-		case 0xB8: case 0xB9: case 0xBA: case 0xBB: case 0xBC: case 0xBD:
-		case 0xBE: case 0xBF: { BYTE src = GetReg(op & 7); int r = A - src; SetFlagsSub(A, src, r); return cycles; }
-
-				 // Операции с непосредственным значением (Иммедиат)
-		case 0xC6: { BYTE imm = Read(PC++); int r = A + imm; SetFlagsAdd(A, imm, r); A = (BYTE)r; return cycles; }
-		case 0xCE: { BYTE imm = Read(PC++); int r = A + imm + (CY ? 1 : 0); SetFlagsAdd(A, imm, r); A = (BYTE)r; return cycles; }
-		case 0xD6: { BYTE imm = Read(PC++); int r = A - imm; SetFlagsSub(A, imm, r); A = (BYTE)r; return cycles; }
-		case 0xDE: { BYTE imm = Read(PC++); int r = A - imm - (CY ? 1 : 0); SetFlagsSub(A, imm, r); A = (BYTE)r; return cycles; }
-		case 0xE6: { A &= Read(PC++); CY = false; AC = true; SetFlagsZSP(A); return cycles; }
-		case 0xEE: { A ^= Read(PC++); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
-		case 0xF6: { A |= Read(PC++); CY = false; AC = false; SetFlagsZSP(A); return cycles; }
-		case 0xFE: { BYTE imm = Read(PC++); int r = A - imm; SetFlagsSub(A, imm, r); return cycles; }
-
-				 // Безусловные JMP / CALL / RET
-		case 0xC3: { WORD l = Read(PC++); WORD h = Read(PC++); PC = (h << 8) | l; return cycles; }
-		case 0xCD: { WORD l = Read(PC++); WORD h = Read(PC++); Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; return cycles; }
-		case 0xC9: { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; return cycles; }
-
-				 // Возвраты по условию (При переходе тратится 11 тактов вместо 5 базовых)
-		case 0xC0: if (!Z) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-		case 0xC8: if (Z) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-		case 0xD0: if (!CY) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-		case 0xD8: if (CY) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-		case 0xE0: if (!P) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-		case 0xE8: if (P) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-		case 0xF0: if (!S) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-		case 0xF8: if (S) { WORD l = Read(SP++); WORD h = Read(SP++); PC = (h << 8) | l; cycles = 11; } return cycles;
-
-				 // Переходы по условию (Всегда занимают 10 тактов в 8080)
-		case 0xC2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!Z) { PC = (h << 8) | l; } return cycles; }
-		case 0xCA: { WORD l = Read(PC++); WORD h = Read(PC++); if (Z) { PC = (h << 8) | l; } return cycles; }
-		case 0xD2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!CY) { PC = (h << 8) | l; } return cycles; }
-		case 0xDA: { WORD l = Read(PC++); WORD h = Read(PC++); if (CY) { PC = (h << 8) | l; } return cycles; }
-		case 0xE2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!P) { PC = (h << 8) | l; } return cycles; }
-		case 0xEA: { WORD l = Read(PC++); WORD h = Read(PC++); if (P) { PC = (h << 8) | l; } return cycles; }
-		case 0xF2: { WORD l = Read(PC++); WORD h = Read(PC++); if (!S) { PC = (h << 8) | l; } return cycles; }
-		case 0xFA: { WORD l = Read(PC++); WORD h = Read(PC++); if (S) { PC = (h << 8) | l; } return cycles; }
-
-				 // Вызовы по условию (При вызове тратится 17 тактов вместо 11 базовых)
-		case 0xC4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!Z) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-		case 0xCC: { WORD l = Read(PC++); WORD h = Read(PC++); if (Z) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-		case 0xD4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!CY) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-		case 0xDC: { WORD l = Read(PC++); WORD h = Read(PC++); if (CY) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-		case 0xE4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!P) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-		case 0xEC: { WORD l = Read(PC++); WORD h = Read(PC++); if (P) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-		case 0xF4: { WORD l = Read(PC++); WORD h = Read(PC++); if (!S) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-		case 0xFC: { WORD l = Read(PC++); WORD h = Read(PC++); if (S) { Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (h << 8) | l; cycles = 17; } return cycles; }
-
-				 // INX / DCX
-		case 0x03: SetBC(GetBC() + 1); return cycles;
-		case 0x13: SetDE(GetDE() + 1); return cycles;
-		case 0x23: SetHL(GetHL() + 1); return cycles;
-		case 0x33: SP++; return cycles;
-		case 0x0B: SetBC(GetBC() - 1); return cycles;
-		case 0x1B: SetDE(GetDE() - 1); return cycles;
-		case 0x2B: SetHL(GetHL() - 1); return cycles;
-		case 0x3B: SP--; return cycles;
-
-				 // INR / DCR
-		case 0x04: { BYTE old = B; B++; SetFlagsINR(old, B); return cycles; }
-		case 0x05: { BYTE old = B; B--; SetFlagsDCR(old, B); return cycles; }
-		case 0x0C: { BYTE old = C; C++; SetFlagsINR(old, C); return cycles; }
-		case 0x0D: { BYTE old = C; C--; SetFlagsDCR(old, C); return cycles; }
-		case 0x14: { BYTE old = D; D++; SetFlagsINR(old, D); return cycles; }
-		case 0x15: { BYTE old = D; D--; SetFlagsDCR(old, D); return cycles; }
-		case 0x1C: { BYTE old = E; E++; SetFlagsINR(old, E); return cycles; }
-		case 0x1D: { BYTE old = E; E--; SetFlagsDCR(old, E); return cycles; }
-		case 0x24: { BYTE old = H; H++; SetFlagsINR(old, H); return cycles; }
-		case 0x25: { BYTE old = H; H--; SetFlagsDCR(old, H); return cycles; }
-		case 0x2C: { BYTE old = L; L++; SetFlagsINR(old, L); return cycles; }
-		case 0x2D: { BYTE old = L; L--; SetFlagsDCR(old, L); return cycles; }
-		case 0x34: { BYTE old = Read(GetHL()); BYTE v = old + 1; Write(GetHL(), v); SetFlagsINR(old, v); return cycles; }
-		case 0x35: { BYTE old = Read(GetHL()); BYTE v = old - 1; Write(GetHL(), v); SetFlagsDCR(old, v); return cycles; }
-		case 0x3C: { BYTE old = A; A++; SetFlagsINR(old, A); return cycles; }
-		case 0x3D: { BYTE old = A; A--; SetFlagsDCR(old, A); return cycles; }
-
-				 // DAD rp
-		case 0x09: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetBC(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
-		case 0x19: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetDE(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
-		case 0x29: { unsigned int r = (unsigned int)GetHL() + (unsigned int)GetHL(); CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
-		case 0x39: { unsigned int r = (unsigned int)GetHL() + (unsigned int)SP;    CY = (r > 0xFFFF); SetHL((WORD)(r & 0xFFFF)); return cycles; }
-
-				 // PUSH / POP
-		case 0xC5: Write(--SP, B); Write(--SP, C); return cycles;
-		case 0xD5: Write(--SP, D); Write(--SP, E); return cycles;
-		case 0xE5: Write(--SP, H); Write(--SP, L); return cycles;
-		case 0xF5: { BYTE psw = (S << 7) | (Z << 6) | (0 << 5) | (AC << 4) | (0 << 3) | (P << 2) | (2) | (CY ? 1 : 0); Write(--SP, A); Write(--SP, psw); return cycles; }
-		case 0xC1: C = Read(SP++); B = Read(SP++); return cycles;
-		case 0xD1: E = Read(SP++); D = Read(SP++); return cycles;
-		case 0xE1: L = Read(SP++); H = Read(SP++); return cycles;
-		case 0xF1: { BYTE psw = Read(SP++); A = Read(SP++); S = (psw & 0x80) != 0; Z = (psw & 0x40) != 0; AC = (psw & 0x10) != 0; P = (psw & 0x04) != 0; CY = (psw & 0x01) != 0; return cycles; }
-
-				 // Прямая адресация (STA, LDA, SHLD, LHLD)
-		case 0x32: { WORD l = Read(PC++); WORD h = Read(PC++); Write((h << 8) | l, A); return cycles; }
-		case 0x3A: { WORD l = Read(PC++); WORD h = Read(PC++); A = Read((h << 8) | l); return cycles; }
-		case 0x22: { WORD l = Read(PC++); WORD h = Read(PC++); WORD a = (h << 8) | l; Write(a, L); Write(a + 1, H); return cycles; }
-		case 0x2A: { WORD l = Read(PC++); WORD h = Read(PC++); WORD a = (h << 8) | l; L = Read(a); H = Read(a + 1); return cycles; }
-
-				 // Косвенная адресация
-		case 0x02: Write(GetBC(), A); return cycles;
-		case 0x12: Write(GetDE(), A); return cycles;
-		case 0x0A: A = Read(GetBC()); return cycles;
-		case 0x1A: A = Read(GetDE()); return cycles;
-
-				 // Циклические сдвиги аккумулятора
-		case 0x07: { CY = (A & 0x80) != 0; A = (BYTE)(((A << 1) | (CY ? 1 : 0)) & 0xFF); return cycles; }
-		case 0x0F: { CY = (A & 1) != 0; A = (BYTE)(((A >> 1) | (CY ? 0x80 : 0)) & 0xFF); return cycles; }
-		case 0x17: { bool old_cy = CY; CY = (A & 0x80) != 0; A = (BYTE)(((A << 1) | (old_cy ? 1 : 0)) & 0xFF); return cycles; }
-		case 0x1F: { bool old_cy = CY; CY = (A & 1) != 0; A = (BYTE)(((A >> 1) | (old_cy ? 0x80 : 0)) & 0xFF); return cycles; }
-
-				 // RST 0 - RST 7
-		case 0xC7: case 0xCF: case 0xD7: case 0xDF: case 0xE7: case 0xEF: case 0xF7: case 0xFF:
-			Write(--SP, PC >> 8); Write(--SP, PC & 0xFF); PC = (op & 0x38); return cycles;
-
-				 // OUT port
-		case 0xD3: {
-			BYTE port = Read(PC++);
-			WORD target_addr = (port << 8) | port; // Аппаратное дублирование байта порта
-			Write(target_addr, A);                 // Перенаправляем запись в память (в область портов)
-			return cycles;
-		}
-
-				 // IN port
-		case 0xDB: {
-			BYTE port = Read(PC++);
-			WORD target_addr = (port << 8) | port; // Аппаратное дублирование байта порта
-			A = Read(target_addr);                 // Читаем из памяти как из порта
-			return cycles;
-		}
-
-				 // Десятичная коррекция аккумулятора (DAA)
-		case 0x27: {
-			BYTE corr = 0; bool new_cy = CY;
-			if ((A & 0x0F) > 9 || AC) corr |= 0x06;
-			if (A > 0x99 || CY) { corr |= 0x60; new_cy = true; }
-			int res = A + corr; AC = ((A & 0x0F) + (corr & 0x0F)) > 0x0F;
-			A = (BYTE)res; CY = new_cy; SetFlagsZSP(A); return cycles;
-		}
-
-				 // Специальные команды
-		case 0x2F: A = (BYTE)(~A & 0xFF); return cycles;
-		case 0x37: CY = true; return cycles;
-		case 0x3F: CY = !CY; return cycles;
-		case 0xEB: { BYTE t = D; D = H; H = t; t = E; E = L; L = t; return cycles; }
-		case 0xE3: { BYTE l = Read(SP); BYTE h = Read(SP + 1); Write(SP, L); Write(SP + 1, H); L = l; H = h; return cycles; }
-		case 0xF9: SP = GetHL(); return cycles;
-		case 0xE9: PC = GetHL(); return cycles;
-		case 0xFB: EI = true; rk_inte_speaker_state = true; return cycles;  // EI включает INTE
-		case 0xF3: EI = false; rk_inte_speaker_state = false; return cycles; // DI выключает INTE
-		}
-		return cycles;
+	if ((current_bank == 0 || current_bank == 1) && addr >= 0xF000 && addr <= 0xF3FF) {
+		orion_ram[0][addr] = val;
+		return;
 	}
-};
-#pragma pack(pop)
 
-CPU8080 cpu;
+	orion_ram[current_bank][addr] = val;
+}
+
+static CPU8080 cpu;
 
 // --- ЗАГРУЗКА И КОРРЕКТИРОВКА РОМОВ ---
 bool LoadRawBinaryFile(const wchar_t* filepath, BYTE* target_dest, size_t max_bytes) {
@@ -618,7 +363,7 @@ bool LoadRawBinaryFile(const wchar_t* filepath, BYTE* target_dest, size_t max_by
 
 // --- ИСПРАВЛЕННАЯ ЗАГРУЗКА ПЗУ ---
 void LoadRoms() {
-	cpu.Reset();
+	orion128_reset(&cpu);
 	// ИСПРАВЛЕНО: Загружаем Монитор точно по его физическому адресу 0xF800 в Банке 0
 	if (!LoadRawBinaryFile(L"monitor.bin", &orion_ram[0][0xF800], 2048)) {
 		MessageBoxW(NULL, L"Не удалось открыть файл системного монитора monitor.bin!", L"Предупреждение", MB_OK | MB_ICONWARNING);
@@ -671,7 +416,7 @@ void UpdateRegisterDisplay() {
 	swprintf(buf, 64, L" Порт1: %02Xh (%s, %s)",
 		orion_sys_port1,
 		mode_c ? L"Цветной" : L"Монохром",
-		mode_2 ? L"4-цв (D1=1)" : L"16-цв (D1=0)");
+		mode_2 ? L"16-цв (D1=1)" : L"4-цв (D1=0)");
 	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 }
 
@@ -716,7 +461,7 @@ void RenderScreen(HDC hdc, int xOffset, int yOffset) {
 
 	// 1. МОНОХРОМНЫЙ РЕЖИМ РАБОТЫ ЭКРАНА (Бит D2 = 0)
 	if (!color_mode) {
-		DWORD color_on = (palette_idx == 0) ? 0x0000FF00 : 0x0000FFFF; // Зеленый или Желтый текст
+		DWORD color_on = (palette_idx == 0) ? 0x0000FF00 : 0x00FFFF00; // Зеленый или Желтый текст (DIB: 0x00RRGGBB)
 		DWORD color_off = 0x00000000; // Черный фон
 		for (int x_byte = 0; x_byte < 48; x_byte++) {
 			for (int y = 0; y < 256; y++) {
@@ -860,11 +605,20 @@ void CreateKeyboardUI(HWND hwndParent, HINSTANCE hInst) {
 }
 
 static const int rk_hardware_map[] = {
-	3 * 8 + 3, 2 * 8 + 1, 2 * 8 + 2, 2 * 8 + 3, 2 * 8 + 4, 2 * 8 + 5, 2 * 8 + 6, 2 * 8 + 7, 3 * 8 + 0, 3 * 8 + 1, 2 * 8 + 0, 3 * 8 + 5, 1 * 8 + 0, 1 * 8 + 1, 0,
-	5 * 8 + 2, 4 * 8 + 3, 6 * 8 + 5, 5 * 8 + 3, 4 * 8 + 5, 5 * 8 + 6, 4 * 8 + 7, 7 * 8 + 3, 7 * 8 + 5, 7 * 8 + 2, 5 * 8 + 0, 3 * 8 + 2, 1 * 8 + 2, 0, 0,
-	0, 4 * 8 + 6, 7 * 8 + 1, 6 * 8 + 7, 4 * 8 + 1, 6 * 8 + 0, 6 * 8 + 2, 5 * 8 + 7, 5 * 8 + 4, 4 * 8 + 4, 6 * 8 + 6, 7 * 8 + 4, 3 * 8 + 6, 1 * 8 + 3, 0,
-	0, 6 * 8 + 1, 7 * 8 + 6, 6 * 8 + 3, 5 * 8 + 5, 5 * 8 + 1, 6 * 8 + 4, 7 * 8 + 0, 4 * 8 + 2, 4 * 8 + 0, 3 * 8 + 4, 3 * 8 + 7, 0, 7 * 8 + 7, 7 * 8 + 7,
-	0 * 8 + 0, 0 * 8 + 3, 0 * 8 + 1, 1 * 8 + 4, 1 * 8 + 5, 1 * 8 + 6, 0 * 8 + 4, 0 * 8 + 5, 0 * 8 + 6, 1 * 8 + 7, 0 * 8 + 2, 0
+    // 0 - 14 (Строка 1 экранной клавиатуры: ;+, 1!, 2", ..., ТАБ, ПС)
+    3 * 8 + 3, 2 * 8 + 1, 2 * 8 + 2, 2 * 8 + 3, 2 * 8 + 4, 2 * 8 + 5, 2 * 8 + 6, 2 * 8 + 7, 3 * 8 + 0, 3 * 8 + 1, 2 * 8 + 0, 3 * 8 + 5, 1 * 8 + 0, 1 * 8 + 1, 0,
+    
+    // 15 - 29 (Строка 2 экранной клавиатуры: Й, Ц, У, К, ..., ВК)
+    5 * 8 + 2, 4 * 8 + 3, 6 * 8 + 5, 5 * 8 + 3, 4 * 8 + 5, 5 * 8 + 6, 4 * 8 + 7, 7 * 8 + 3, 7 * 8 + 5, 7 * 8 + 2, 5 * 8 + 0, 3 * 8 + 2, 1 * 8 + 2, 0, 0,
+    
+    // 30 - 44 (Строка 3 экранной клавиатуры: УС, Ф, Ы, В, ..., ЗБ)
+    0, 4 * 8 + 6, 7 * 8 + 1, 6 * 8 + 7, 4 * 8 + 1, 6 * 8 + 0, 6 * 8 + 2, 5 * 8 + 7, 5 * 8 + 4, 4 * 8 + 4, 6 * 8 + 6, 7 * 8 + 4, 3 * 8 + 6, 1 * 8 + 3, 0,
+    
+    // 45 - 59 (Строка 4 экранной клавиатуры: СС, Я, Ч, С, ..., ПРОБЕЛ)
+    0, 6 * 8 + 1, 7 * 8 + 6, 6 * 8 + 3, 5 * 8 + 5, 5 * 8 + 1, 6 * 8 + 4, 7 * 8 + 0, 4 * 8 + 2, 4 * 8 + 0, 3 * 8 + 4, 3 * 8 + 7, 0, 7 * 8 + 7, 7 * 8 + 7,
+    
+    // 60 - 71 (Правый боковой блок: СТРЕЛКИ, F1-F4, СТР, АР2, "В угол")
+    0 * 8 + 0, 0 * 8 + 3, 0 * 8 + 1, 1 * 8 + 4, 1 * 8 + 5, 1 * 8 + 6, 0 * 8 + 4, 0 * 8 + 5, 0 * 8 + 6, 1 * 8 + 7, 0 * 8 + 2, 0
 };
 
 bool MapVirtualKeyToRK(UINT vkCode, int& out_row, int& out_col) {
@@ -1028,6 +782,12 @@ void LoadOrionFile(HWND hwnd) {
 					size_t file_size = file.tellg();
 					file.seekg(0, std::ios::beg);
 
+					if (file_size == 0 || file_size == (size_t)-1) {
+						file.close();
+						MessageBoxW(hwnd, L"Файл пуст или его размер не определён.", L"Ошибка", MB_OK | MB_ICONERROR);
+						return;
+					}
+
 					WORD load_address = 0x0000;
 					WORD file_length = (file_size > 48 * 1024) ? 48 * 1024 : (WORD)file_size;
 
@@ -1040,10 +800,13 @@ void LoadOrionFile(HWND hwnd) {
 					orion_sys_port1 = 0x24; // Форсируем игровой цветной режим 4-цв
 					orion_sys_port3 = 0;
 					cpu.EI = false;
+					cpu.halted = false;          // иначе после прежнего HLT программа не стартует
+					cpu.int_pending = false;
 					cpu.PC = load_address;
-					cpu.SP = 0xEFFF;
+					cpu.SP = 0xBFFF;             // ниже экранной памяти (C000-EFFF), чтобы стек не портил картинку
 
-					orion_ram[0][0xBE03] = 0xC9; // Заглушка под ORDOS
+					// Заглушка под ORDOS (RET) - только если она не затирает данные самой программы
+					if (file_length <= 0xBE03) orion_ram[0][0xBE03] = 0xC9;
 					for (int o_addr = 0xF000; o_addr < 0xF800; o_addr++) {
 						orion_ram[0][o_addr] = 0x00;
 					}
@@ -1142,7 +905,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 		int RIGHT_PANEL_X = 840;
 		CreateWindowExW(0, L"BUTTON", L"СБРОС (RESET)", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON, RIGHT_PANEL_X, 20, 210, 40, hwnd, (HMENU)2000, hInst, NULL);
 		hRegListBox = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", NULL, WS_CHILD | WS_VISIBLE | WS_VSCROLL, RIGHT_PANEL_X, 75, 210, 245, hwnd, (HMENU)2001, NULL, NULL);
-		cpu.Reset();
+		orion128_reset(&cpu);
 		UpdateRegisterDisplay();
 		return 0;
 	}
@@ -1158,7 +921,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 		// 1. Обработка кнопки СБРОС (RESET)
 		if (btn_id == 2000) {
-			cpu.Reset();
+			orion128_reset(&cpu);
 			for (int i = 0; i < 8; i++) key_matrix_state[i] = 0xFF;
 			UpdateRegisterDisplay();
 			InvalidateRect(hwnd, NULL, FALSE);
@@ -1225,72 +988,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 	return 0;
 }
 
-const double PIT_CLOCK_HZ = 2500000.0;
-const double TICKS_PER_SAMPLE = PIT_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
+// Тактов ЦПУ на один звуковой сэмпл (именно частота ЦПУ, а не CLK таймера)
+const double TICKS_PER_SAMPLE = SYSTEM_CLOCK_HZ / (double)AUDIO_SAMPLE_RATE;
 
-// Генерирование звука через КР580ВИ53 на основе накопленной фазы частоты
+// Один сэмпл: бипер INTE + меандры каналов ВИ53 (режимы 2 и 3), среднее двух источников.
+// Вызывается из потока эмуляции, чтобы out каналов брался в момент выполнения инструкций.
+static short MixAudioSample(const CPU8080& c) {
+	short sample = c.EI ? 4000 : -4000;
+	int active = 0, mixed = 0;
+	for (int ch = 0; ch < 3; ch++) {
+		const PITChannel& pc = c.pit_channels[ch];
+		if (pc.armed && (pc.mode == 2 || pc.mode == 3) && pc.reload > 3) {
+			mixed += pc.out ? 1 : -1;
+			active++;
+		}
+	}
+	if (active > 0) {
+		int vi53 = mixed * 5000 / active;
+		sample = (short)((vi53 + sample) / 2);
+	}
+	return sample;
+}
+
+// Аудиопоток только читает готовые сэмплы из кольцевого буфера
 void FillAudioBuffer(short* buffer, int samplesCount) {
-	static double ticks_accumulator = 0.0;
-
 	for (int i = 0; i < samplesCount; i++) {
-		ticks_accumulator += TICKS_PER_SAMPLE;
-		int ticks_to_consume = (int)ticks_accumulator;
-		ticks_accumulator -= ticks_to_consume;
-
-		if (ticks_to_consume <= 0) {
-			buffer[i] = (i > 0) ? buffer[i - 1] : 0;
-			continue;
-		}
-
-		int active_channels = 0;
-		int mixed_signal = 0;
-
-		// 1. Эмуляция каналов КР580ВИ53 (остается оригинальной)
-		for (int ch = 0; ch < 3; ch++) {
-			CPU8080::PITChannel& channel = cpu.pit_channels[ch];
-			WORD divisor = channel.count;
-			BYTE mode = channel.mode & 7;
-
-			if (divisor > 3 && (mode == 2 || mode == 3)) {
-				if (channel.phase <= 0.0 || channel.phase > (double)divisor) {
-					channel.phase = (double)(divisor / 2);
-				}
-				channel.phase -= (double)ticks_to_consume;
-				if (channel.phase <= 0.0) {
-					channel.phase += (double)(divisor / 2);
-					channel.latched = !channel.latched;
-				}
-				mixed_signal += channel.latched ? 1 : -1;
-				active_channels++;
-			}
-		}
-
-		// 2. Извлечение СИНХРОННОГО сигнала INTE из кольцевого буфера
-		int inte_signal = 0;
 		if (inte_ring_read_ptr != inte_ring_write_ptr) {
-			inte_signal = inte_ring_buffer[inte_ring_read_ptr];
+			buffer[i] = inte_ring_buffer[inte_ring_read_ptr];
 			inte_ring_read_ptr = (inte_ring_read_ptr + 1) % INTE_RING_BUF_SIZE;
 		}
 		else {
 			// Если буфер пуст, берем последнее состояние (стабилизация)
-			inte_signal = rk_inte_speaker_state ? 4000 : -4000;
-		}
-
-		// 3. Микширование сигналов
-		if (active_channels > 0) {
-			// Нормализуем меандр ВИ53 к значениям громкости и прибавляем сигнал INTE
-			int vi53_signal = mixed_signal * 5000 / active_channels;
-			buffer[i] = (short)((vi53_signal + inte_signal) / 2);
-		}
-		else {
-			// Работает только чистый бипер INTE
-			buffer[i] = (short)inte_signal;
+			buffer[i] = cpu.EI ? 4000 : -4000;
 		}
 	}
 }
 
+// Флаг завершения: после waveOutReset колбэк получает WOM_DONE для всех буферов и не должен ставить их в очередь снова
+static volatile bool audio_closing = false;
+
 void CALLBACK WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWORD_PTR dwParam1, DWORD_PTR dwParam2) {
-	if (uMsg == WOM_DONE) {
+	if (uMsg == WOM_DONE && !audio_closing) {
 		WAVEHDR* pHdr = (WAVEHDR*)dwParam1;
 		FillAudioBuffer((short*)pHdr->lpData, AUDIO_BUF_SIZE);
 		waveOutWrite(hwo, pHdr, sizeof(WAVEHDR));
@@ -1298,6 +1036,7 @@ void CALLBACK WaveOutCallback(HWAVEOUT hwo, UINT uMsg, DWORD_PTR dwInstance, DWO
 }
 
 static double audio_ticks_accumulator = 0.0;
+static uint64_t pit_accum = 0;   // дробный остаток тактов CLK таймера
 
 // =========================================================================
 // ИСПРАВЛЕННАЯ СТАБИЛЬНАЯ ФУНКЦИЯ WINMAIN С КАДРОВЫМИ ПРЕРЫВАНИЯМИ 50 ГЦ
@@ -1347,7 +1086,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 	QueryPerformanceFrequency(&frequency);
 	QueryPerformanceCounter(&last_hardware_time);
 
-	const double SYSTEM_CLOCK_HZ = 2500000.0; // Частота ядра Орион-128 (2.5 МГц)
 	double time_since_last_interrupt = 0.0;
 
 	while (emulator_running) {
@@ -1410,18 +1148,25 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 			int cycles_to_execute = (int)internal_cycles_debt;
 			if (cycles_to_execute > 0) {
 				while (cycles_to_execute > 0) {
-					int elapsed_ticks = cpu.Step();
+					int elapsed_ticks = cpu8080_step(&cpu);
 
 					cycles_to_execute -= elapsed_ticks;
 					internal_cycles_debt -= elapsed_ticks;
+
+					pit_accum += (uint64_t)elapsed_ticks * PIT_CLOCK_HZ;
+					if (pit_accum >= SYSTEM_CLOCK_HZ) {
+						int ticks = (int)(pit_accum / SYSTEM_CLOCK_HZ);
+						pit_accum %= SYSTEM_CLOCK_HZ;
+						pit_tick(&cpu, ticks);
+					}
 
 					// Накапливаем процессорные такты для генерации звука
 					audio_ticks_accumulator += elapsed_ticks;
 					while (audio_ticks_accumulator >= TICKS_PER_SAMPLE) {
 						audio_ticks_accumulator -= TICKS_PER_SAMPLE;
 
-						// Генерируем сэмпл на основе ТЕКУЩЕГО состояния флага прямо сейчас
-						short sample = rk_inte_speaker_state ? 4000 : -4000;
+						// Сэмпл формируется в момент выполнения инструкций: бипер INTE + каналы ВИ53
+						short sample = MixAudioSample(cpu);
 
 						// Записываем в кольцевой буфер
 						int next_write = (inte_ring_write_ptr + 1) % INTE_RING_BUF_SIZE;
@@ -1435,7 +1180,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 					// Отсчитываем такты до кадрового прерывания 50 Гц
 					cpu.cycles_until_interrupt -= elapsed_ticks;
 					if (cpu.cycles_until_interrupt <= 0) {
-						cpu.int_pending = true; // Выставляем запрос на прерывание для процессора
 						cpu.cycles_until_interrupt += 50000; // На запуск следующего кадра
 
 						// Автоматическое плавное отжатие экранных кнопок GUI (раз в 20 мс)
@@ -1464,6 +1208,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 
 	// --- Безопасная очистка аудиодескрипторов перед выходом ---
 	if (hWaveOut) {
+		audio_closing = true;    // колбэк больше не ставит буферы в очередь
+		waveOutReset(hWaveOut); // вернуть все буферы, иначе Unprepare/Close завершатся ошибкой
 		for (int i = 0; i < 2; i++) {
 			waveOutUnprepareHeader(hWaveOut, &waveHeader[i], sizeof(WAVEHDR));
 			delete[] audioBuffers[i];
@@ -1472,4 +1218,3 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE, LPSTR, int nCmdShow) {
 	}
 	return (int)msg.wParam;
 }
-
