@@ -3,16 +3,14 @@
 #define _UNICODE
 #include <windows.h>
 #include <mmsystem.h>
-#include <fstream>
-#include <string>
-#include <vector>
-#include <cstdlib>
-#include <cwchar>
-#include <cmath>
 #include <commdlg.h>
 #include "8080.h"
 
+#pragma comment (lib, "libcmt.lib")
 #pragma comment(lib, "winmm.lib")
+#pragma comment (lib, "User32.lib")
+#pragma comment (lib, "Gdi32.lib")
+#pragma comment (lib, "Comdlg32.lib")
 
 extern "C" int cpu8080_step(CPU8080* cpu);
 extern "C" void cpu8080_reset(CPU8080* cpu);
@@ -354,17 +352,32 @@ static CPU8080 cpu;
 
 // --- ЗАГРУЗКА И КОРРЕКТИРОВКА РОМОВ ---
 bool LoadRawBinaryFile(const wchar_t* filepath, BYTE* target_dest, size_t max_bytes) {
-	std::ifstream file(filepath, std::ios::binary);
-	if (!file.is_open()) return false;
-	file.read(reinterpret_cast<char*>(target_dest), max_bytes);
-	file.close();
-	return true;
+	// Открываем файл средствами операционной системы
+	HANDLE hFile = CreateFileW(
+		filepath, 
+		GENERIC_READ, 
+		FILE_SHARE_READ, 
+		NULL, 
+		OPEN_EXISTING, 
+		FILE_ATTRIBUTE_NORMAL, 
+		NULL
+	);
+	
+	if (hFile == INVALID_HANDLE_VALUE) return false;
+
+	DWORD bytesRead = 0;
+	// Читаем поток байт напрямую в целевой буфер ОЗУ
+	BOOL success = ReadFile(hFile, target_dest, (DWORD)max_bytes, &bytesRead, NULL);
+	
+	CloseHandle(hFile);
+	return success && (bytesRead > 0);
 }
 
 // --- ИСПРАВЛЕННАЯ ЗАГРУЗКА ПЗУ ---
 void LoadRoms() {
 	orion128_reset(&cpu);
-	// ИСПРАВЛЕНО: Загружаем Монитор точно по его физическому адресу 0xF800 в Банке 0
+	
+	// Загружаем Монитор физически по его стартовому адресу 0xF800 в Банке 0
 	if (!LoadRawBinaryFile(L"monitor.bin", &orion_ram[0][0xF800], 2048)) {
 		MessageBoxW(NULL, L"Не удалось открыть файл системного монитора monitor.bin!", L"Предупреждение", MB_OK | MB_ICONWARNING);
 	}
@@ -380,25 +393,27 @@ void LoadRoms() {
 
 void UpdateRegisterDisplay() {
 	SendMessageW(hRegListBox, LB_RESETCONTENT, 0, 0);
-	wchar_t buf[64];
-	swprintf(buf, 64, L" PC: %04Xh  SP: %04Xh", cpu.PC, cpu.SP);
+	
+	// Выделяем заведомо избыточный буфер в стеке, исключая переполнение в wsprintfW
+	wchar_t buf[128];
+	
+	wsprintfW(buf, L" PC: %04Xh  SP: %04Xh", cpu.PC, cpu.SP);
 	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 
 	// Показываем текущий банк процессора и физический банк видеовыхода
-	swprintf(buf, 64, L" REG A: %02Xh  Банк ОЗУ: %d", cpu.A, orion_page);
+	wsprintfW(buf, L" REG A: %02Xh  Банк ОЗУ: %d", cpu.A, orion_page);
 	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 
-	swprintf(buf, 64, L" REG B: %02Xh  REG C: %02Xh", cpu.B, cpu.C);
+	wsprintfW(buf, L" REG B: %02Xh  REG C: %02Xh", cpu.B, cpu.C);
 	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
-	swprintf(buf, 64, L" REG D: %02Xh  REG E: %02Xh", cpu.D, cpu.E);
+	wsprintfW(buf, L" REG D: %02Xh  REG E: %02Xh", cpu.D, cpu.E);
 	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
-	swprintf(buf, 64, L" REG H: %02Xh  REG L: %02Xh", cpu.H, cpu.L);
-	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
-
-	swprintf(buf, 64, L" Флаги: S:%d Z:%d AC:%d P:%d CY:%d", cpu.S, cpu.Z, cpu.AC, cpu.P, cpu.CY);
+	wsprintfW(buf, L" REG H: %02Xh  REG L: %02Xh", cpu.H, cpu.L);
 	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 
-	// Расширенная видео-отладка
+	wsprintfW(buf, L" Флаги: S:%d Z:%d AC:%d P:%d CY:%d", cpu.S, cpu.Z, cpu.AC, cpu.P, cpu.CY);
+	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
+
 	WORD screen_addr = 0xC000;
 	switch (orion_sys_port3 & 3) {
 	case 0: screen_addr = 0xC000; break;
@@ -407,13 +422,12 @@ void UpdateRegisterDisplay() {
 	case 3: screen_addr = 0x0000; break;
 	}
 
-	swprintf(buf, 64, L" Экран: №%d (Адрес: %04Xh)", orion_sys_port3 + 1, screen_addr);
+	wsprintfW(buf, L" Экран: №%d (Адрес: %04Xh)", orion_sys_port3 + 1, screen_addr);
 	SendMessageW(hRegListBox, LB_ADDSTRING, 0, (LPARAM)buf);
 
-	// Битовая расшифровка Порта 1
 	bool mode_c = (orion_sys_port1 & 0x04) != 0;
 	bool mode_2 = (orion_sys_port1 & 0x02) != 0;
-	swprintf(buf, 64, L" Порт1: %02Xh (%s, %s)",
+	wsprintfW(buf, L" Порт1: %02Xh (%s, %s)",
 		orion_sys_port1,
 		mode_c ? L"Цветной" : L"Монохром",
 		mode_2 ? L"16-цв (D1=1)" : L"4-цв (D1=0)");
@@ -730,9 +744,9 @@ WORD GetNextOrdosOffset() {
 }
 
 void LoadOrionFile(HWND hwnd) {
-	OPENFILENAMEW ofn;
-	wchar_t szFile[1024] = { 0 }; // Буфер увеличен для поддержки Multi-Select без STD
-	ZeroMemory(&ofn, sizeof(ofn));
+	OPENFILENAMEW ofn = { 0 }; // Обнуление встроенным инициализатором C++ без memset
+	wchar_t szFile[1024] = { 0 };
+	
 	ofn.lStructSize = sizeof(ofn);
 	ofn.hwndOwner = hwnd;
 	ofn.lpstrFile = szFile;
@@ -742,48 +756,52 @@ void LoadOrionFile(HWND hwnd) {
 	ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST | OFN_ALLOWMULTISELECT | OFN_EXPLORER;
 
 	if (GetOpenFileNameW(&ofn) == TRUE) {
-		// Указатель для ручного разбора путей Multi-Select (строки разделены '\0')
 		wchar_t* ptr = ofn.lpstrFile;
 		wchar_t dir[512] = { 0 };
-		wcscpy(dir, ptr);
-		ptr += wcslen(dir) + 1;
+		lstrcpynW(dir, ptr, 512); // Безопасное копирование Win32 API вместо wcscpy
+		ptr += lstrlenW(dir) + 1;
 
-		// Если выбран один файл, ptr сразу будет указывать на конец буфера. 
-		// Если несколько — dir содержит общую папку, а ptr последовательно имена файлов.
 		bool is_multi = (*ptr != L'\0');
 		int loaded_count = 0;
 
 		do {
 			wchar_t full_path[512] = { 0 };
 			if (is_multi) {
-				swprintf(full_path, 512, L"%s\\%s", dir, ptr);
-				ptr += wcslen(ptr) + 1;
+				wsprintfW(full_path, L"%s\\%s", dir, ptr);
+				ptr += lstrlenW(ptr) + 1;
 			}
 			else {
-				wcscpy(full_path, dir);
+				lstrcpynW(full_path, dir, 512);
 			}
 
-			// Извлекаем расширение файла вручную (в нижнем регистре)
 			wchar_t ext[8] = { 0 };
-			wchar_t* dot = wcsrchr(full_path, L'.');
+			wchar_t* dot = NULL;
+			int path_len = lstrlenW(full_path);
+			for (int i = path_len - 1; i >= 0; i--) {
+				if (full_path[i] == L'.') {
+					dot = &full_path[i];
+					break;
+				}
+			}
 			if (dot) {
 				int i = 0;
 				while (dot[i] && i < 7) {
-					ext[i] = towlower(dot[i]);
+					wchar_t ch = dot[i];
+					ext[i] = (ch >= L'A' && ch <= L'Z') ? (ch + (L'a' - L'A')) : ch;
 					i++;
 				}
 			}
 
 			// Проверяем: если это обычный бинарник .BIN, обрабатываем по старому алгоритму
-			if (wcscmp(ext, L".bin") == 0) {
-				std::ifstream file(full_path, std::ios::binary);
-				if (file.is_open()) {
-					file.seekg(0, std::ios::end);
-					size_t file_size = file.tellg();
-					file.seekg(0, std::ios::beg);
+			if (lstrcmpW(ext, L".bin") == 0) {
+				HANDLE hFile = CreateFileW(full_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+				if (hFile != INVALID_HANDLE_VALUE) {
+					LARGE_INTEGER fileSize;
+					GetFileSizeEx(hFile, &fileSize);
+					size_t file_size = (size_t)fileSize.QuadPart;
 
-					if (file_size == 0 || file_size == (size_t)-1) {
-						file.close();
+					if (file_size == 0) {
+						CloseHandle(hFile);
 						MessageBoxW(hwnd, L"Файл пуст или его размер не определён.", L"Ошибка", MB_OK | MB_ICONERROR);
 						return;
 					}
@@ -792,8 +810,9 @@ void LoadOrionFile(HWND hwnd) {
 					WORD file_length = (file_size > 48 * 1024) ? 48 * 1024 : (WORD)file_size;
 
 					// Читаем исполняемый код программы строго в БАНК 0 (как было раньше)
-					file.read(reinterpret_cast<char*>(&orion_ram[0][load_address]), file_length);
-					file.close();
+					DWORD bytesRead = 0;
+					ReadFile(hFile, &orion_ram[0][load_address], file_length, &bytesRead, NULL);
+					CloseHandle(hFile);
 
 					// Полный аппаратный сброс и подготовка контекста под запуск игры
 					orion_page = 0;
@@ -806,6 +825,7 @@ void LoadOrionFile(HWND hwnd) {
 					cpu.SP = 0xBFFF;             // ниже экранной памяти (C000-EFFF), чтобы стек не портил картинку
 
 					// Заглушка под ORDOS (RET) - только если она не затирает данные самой программы
+
 					if (file_length <= 0xBE03) orion_ram[0][0xBE03] = 0xC9;
 					for (int o_addr = 0xF000; o_addr < 0xF800; o_addr++) {
 						orion_ram[0][o_addr] = 0x00;
@@ -816,7 +836,7 @@ void LoadOrionFile(HWND hwnd) {
 					InvalidateRect(hwnd, NULL, FALSE);
 
 					wchar_t msg_buf[256];
-					swprintf(msg_buf, 256, L"Бинарный файл успешно запущен!\nАдрес старта: %04Xh\nРазмер: %d байт", load_address, file_length);
+					wsprintfW(msg_buf, L"Бинарный файл успешно запущен!\nАдрес старта: %04Xh\nРазмер: %d байт", load_address, file_length);
 					MessageBoxW(hwnd, msg_buf, L"Успех", MB_OK | MB_ICONINFORMATION);
 				}
 				return; // .BIN файлы обрабатываются одиночно, прерываем функцию
@@ -831,20 +851,20 @@ void LoadOrionFile(HWND hwnd) {
 				}
 			}
 
-			std::ifstream file(full_path, std::ios::binary);
-			if (file.is_open()) {
-				file.seekg(0, std::ios::end);
-				size_t file_size = file.tellg();
-				file.seekg(0, std::ios::beg);
+			HANDLE hFile = CreateFileW(full_path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+			if (hFile != INVALID_HANDLE_VALUE) {
+				LARGE_INTEGER fileSize;
+				GetFileSizeEx(hFile, &fileSize);
+				size_t file_size = (size_t)fileSize.QuadPart;
 
-				bool is_rko = (wcscmp(ext, L".rko") == 0);
+				bool is_rko = (lstrcmpW(ext, L".rko") == 0);
 				if (is_rko) {
 					if (file_size > 77) {
-						file.seekg(77, std::ios::beg);
+						SetFilePointer(hFile, 77, NULL, FILE_BEGIN); // Эквивалент seekg
 						file_size -= 77;
 					}
 					else {
-						file.close();
+						CloseHandle(hFile);
 						continue;
 					}
 				}
@@ -854,22 +874,23 @@ void LoadOrionFile(HWND hwnd) {
 
 				if (next_ordos + 16 < RAMDISK_TOP) {
 					BYTE ordos_header[16];
-					if (file.read(reinterpret_cast<char*>(ordos_header), 16)) {
+					DWORD bytesRead = 0;
+					if (ReadFile(hFile, ordos_header, 16, &bytesRead, NULL) && bytesRead == 16) {
 						WORD datasize = ordos_header[10] | (ordos_header[11] << 8);
 
 						if (next_ordos + 16 + datasize < RAMDISK_TOP) {
 							// Копируем заголовок на страницу 1 (Диск B)
 							memcpy(&orion_ram[1][next_ordos], ordos_header, 16);
 							// Читаем данные следом за заголовком
-							file.read(reinterpret_cast<char*>(&orion_ram[1][next_ordos + 16]), datasize);
+							ReadFile(hFile, &orion_ram[1][next_ordos + 16], datasize, &bytesRead, NULL);
 
 							next_ordos += 16 + datasize;
-							orion_ram[1][next_ordos] = 0xFF; // Конец цепочки файлов
+							orion_ram[1][next_ordos] = 0xFF; // Конец цепочки файлов 
 							loaded_count++;
 						}
 					}
 				}
-				file.close();
+				CloseHandle(hFile);
 			}
 
 		} while (is_multi && *ptr != L'\0');
@@ -879,7 +900,7 @@ void LoadOrionFile(HWND hwnd) {
 			InvalidateRect(hwnd, NULL, FALSE);
 
 			wchar_t msg_buf[256];
-			swprintf(msg_buf, 256, L"Загружено файлов на диск B: %d.\nПерезапустите Оболочку/Командер (кнопка F4).", loaded_count);
+			wsprintfW(msg_buf, L"Загружено файлов на диск B: %d.\nПерезапустите Оболочку/Командер (кнопка F4).", loaded_count);
 			MessageBoxW(hwnd, msg_buf, L"Информация", MB_OK | MB_ICONINFORMATION);
 		}
 	}
